@@ -1,10 +1,9 @@
 // WebGPU renderer: GPU cluster selection (compute) + indirect vertex-pulled draw.
 
 import { MAX_CLUSTER_TRIS, type BuildResult } from './builder';
-import type { Environment } from './environment';
 import type { MaterialInfo } from './loader';
-import { frustumPlanes, invert, type Mat4, type Vec3 } from './math';
-import { cullShader, drawShader, mipShader, prefilterShader } from './shaders';
+import { frustumPlanes, type Mat4, type Vec3 } from './math';
+import { cullShader, drawShader, mipShader } from './shaders';
 
 export interface FrameParams {
   viewProj: Mat4;
@@ -25,16 +24,14 @@ export interface GpuStats {
   gpuDrawMs: number | null;
 }
 
-const UNIFORM_SIZE = 464;
-const EXPOSURE = 1.0;
-const REFLECTION_LEVELS = 6; // prefiltered roughness steps: 0, 0.2, ... 1
+const UNIFORM_SIZE = 240;
 const STATS_SIZE = 16 + 32 * 4;
 const SAMPLES = 4;
 const READBACK_SIZE = 16 + STATS_SIZE + 32; // draw args + stats + 4 timestamps
 
 interface Scene {
-  buffers: Record<'clusters' | 'indices' | 'positions' | 'normals' | 'uvs', GPUBuffer>;
-  textures: Record<'baseColor' | 'normalMap' | 'metalRough', GPUTexture>;
+  buffers: GPUBuffer[];
+  textures: GPUTexture[];
   material: { baseColorFactor: number[]; metallic: number; roughness: number; normalScale: number };
   cullBindGroup: GPUBindGroup;
   drawBindGroup: GPUBindGroup;
@@ -66,10 +63,6 @@ export class Renderer {
   private mipSampler: GPUSampler;
   private mipModule: GPUShaderModule;
   private mipPipelines = new Map<GPUTextureFormat, GPURenderPipeline>();
-  private skyPipeline: GPURenderPipeline;
-  private prefilterPipeline: GPURenderPipeline;
-  private envSampler: GPUSampler;
-  private env: { sky: GPUTexture; specular: GPUTexture; sh: Float32Array; maxLod: number };
 
   static async create(canvas: HTMLCanvasElement): Promise<Renderer> {
     if (!navigator.gpu) throw new Error('WebGPU is not available in this browser.');
@@ -124,17 +117,13 @@ export class Renderer {
         { binding: 8, visibility: F, texture: { sampleType: 'float' } }, // base colour
         { binding: 9, visibility: F, texture: { sampleType: 'float' } }, // normal map
         { binding: 10, visibility: F, texture: { sampleType: 'float' } }, // metallic-roughness
-        { binding: 11, visibility: F, sampler: { type: 'filtering' } },
-        { binding: 12, visibility: F, texture: { sampleType: 'float' } }, // environment reflections
-        { binding: 13, visibility: F, texture: { sampleType: 'float' } }, // environment background
       ],
     });
 
     const cullModule = device.createShaderModule({ code: cullShader, label: 'cull' });
     const drawModule = device.createShaderModule({ code: drawShader, label: 'draw' });
     this.mipModule = device.createShaderModule({ code: mipShader, label: 'mip' });
-    const prefilterModule = device.createShaderModule({ code: prefilterShader, label: 'prefilter' });
-    for (const m of [cullModule, drawModule, this.mipModule, prefilterModule]) {
+    for (const m of [cullModule, drawModule, this.mipModule]) {
       m.getCompilationInfo().then((info) => {
         for (const msg of info.messages) console[msg.type === 'error' ? 'error' : 'warn'](`${m.label}:${msg.lineNum}:${msg.linePos} ${msg.message}`);
       });
@@ -144,27 +133,13 @@ export class Renderer {
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.cullLayout] }),
       compute: { module: cullModule, entryPoint: 'main' },
     });
-    const drawPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.drawLayout] });
     this.drawPipeline = device.createRenderPipeline({
-      layout: drawPipelineLayout,
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.drawLayout] }),
       vertex: { module: drawModule, entryPoint: 'vs' },
       fragment: { module: drawModule, entryPoint: 'fs', targets: [{ format: this.format }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
       multisample: { count: SAMPLES },
-    });
-    // Background: a fullscreen triangle under everything (no depth write).
-    this.skyPipeline = device.createRenderPipeline({
-      layout: drawPipelineLayout,
-      vertex: { module: drawModule, entryPoint: 'skyVs' },
-      fragment: { module: drawModule, entryPoint: 'skyFs', targets: [{ format: this.format }] },
-      depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'always' },
-      multisample: { count: SAMPLES },
-    });
-    this.prefilterPipeline = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: prefilterModule, entryPoint: 'vs' },
-      fragment: { module: prefilterModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
     });
 
     this.uniformBuffer = device.createBuffer({ size: UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -192,22 +167,6 @@ export class Renderer {
       maxAnisotropy: 8,
     });
     this.mipSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    this.envSampler = device.createSampler({
-      addressModeU: 'repeat',
-      addressModeV: 'clamp-to-edge',
-      magFilter: 'linear',
-      minFilter: 'linear',
-      mipmapFilter: 'linear',
-    });
-    // Until an HDR loads: a flat grey sky (half-float 0.5) and matching constant irradiance.
-    const grey = () => {
-      const t = device.createTexture({ size: [1, 1], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-      device.queue.writeTexture({ texture: t }, new Uint16Array([0x3800, 0x3800, 0x3800, 0x3c00]), { bytesPerRow: 8 }, [1, 1]);
-      return t;
-    };
-    const sh = new Float32Array(36);
-    sh.fill(0.5 / 0.282095, 0, 3);
-    this.env = { sky: grey(), specular: grey(), sh, maxLod: 0 };
     if (device.features.has('timestamp-query')) {
       this.timing = {
         querySet: device.createQuerySet({ type: 'timestamp', count: 4 }),
@@ -219,8 +178,8 @@ export class Renderer {
   setScene(r: BuildResult, material: MaterialInfo | null) {
     const d = this.device;
     if (this.scene) {
-      for (const b of Object.values(this.scene.buffers)) b.destroy();
-      for (const t of Object.values(this.scene.textures)) t.destroy();
+      for (const b of this.scene.buffers) b.destroy();
+      for (const t of this.scene.textures) t.destroy();
       this.scene = null;
     }
     const maxBinding = d.limits.maxStorageBufferBindingSize;
@@ -235,33 +194,46 @@ export class Renderer {
       d.queue.writeBuffer(buf, 0, bytes);
       return buf;
     };
-    const buffers = {
-      clusters: upload(r.clusters, 'clusters'),
-      indices: upload(r.indices, 'indices'),
-      positions: upload(r.positions, 'positions'),
-      normals: upload(r.normals, 'normals'),
-      uvs: upload(r.uvs, 'uvs'),
-    };
+    const clusterBuffer = upload(r.clusters, 'clusters');
+    const indexBuffer = upload(r.indices, 'indices');
+    const positionBuffer = upload(r.positions, 'positions');
+    const normalBuffer = upload(r.normals, 'normals');
+    const uvBuffer = upload(r.uvs, 'uvs');
+
     // Missing maps fall back to 1x1 textures that leave the factors unchanged.
-    const textures = {
-      baseColor: this.texture(material?.baseColor ?? null, 'rgba8unorm-srgb', [255, 255, 255, 255]),
-      normalMap: this.texture(material?.normal ?? null, 'rgba8unorm', [128, 128, 255, 255]),
-      metalRough: this.texture(material?.metallicRoughness ?? null, 'rgba8unorm', [255, 255, 255, 255]),
-    };
+    const baseColor = this.texture(material?.baseColor ?? null, 'rgba8unorm-srgb', [255, 255, 255, 255]);
+    const normalMap = this.texture(material?.normal ?? null, 'rgba8unorm', [128, 128, 255, 255]);
+    const metalRough = this.texture(material?.metallicRoughness ?? null, 'rgba8unorm', [255, 255, 255, 255]);
 
     const cullBindGroup = d.createBindGroup({
       layout: this.cullLayout,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: buffers.clusters } },
+        { binding: 1, resource: { buffer: clusterBuffer } },
         { binding: 2, resource: { buffer: this.drawArgsBuffer } },
         { binding: 3, resource: { buffer: this.visibleBuffer } },
         { binding: 4, resource: { buffer: this.statsBuffer } },
       ],
     });
+    const drawBindGroup = d.createBindGroup({
+      layout: this.drawLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: clusterBuffer } },
+        { binding: 2, resource: { buffer: this.visibleBuffer } },
+        { binding: 3, resource: { buffer: indexBuffer } },
+        { binding: 4, resource: { buffer: positionBuffer } },
+        { binding: 5, resource: { buffer: normalBuffer } },
+        { binding: 6, resource: { buffer: uvBuffer } },
+        { binding: 7, resource: this.sampler },
+        { binding: 8, resource: baseColor.createView() },
+        { binding: 9, resource: normalMap.createView() },
+        { binding: 10, resource: metalRough.createView() },
+      ],
+    });
     this.scene = {
-      buffers,
-      textures,
+      buffers: [clusterBuffer, indexBuffer, positionBuffer, normalBuffer, uvBuffer],
+      textures: [baseColor, normalMap, metalRough],
       material: {
         baseColorFactor: material?.baseColorFactor ?? [1, 1, 1, 1],
         // A mesh with no material at all gets a plain dielectric instead of glTF's default metal.
@@ -270,86 +242,10 @@ export class Renderer {
         normalScale: material?.normalScale ?? 1,
       },
       cullBindGroup,
-      drawBindGroup: this.drawBindGroup(buffers, textures),
+      drawBindGroup,
       numClusters: r.clusterCount,
       minDist: r.radius * 1e-6,
     };
-  }
-
-  private drawBindGroup(buffers: Scene['buffers'], textures: Scene['textures']): GPUBindGroup {
-    return this.device.createBindGroup({
-      layout: this.drawLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: buffers.clusters } },
-        { binding: 2, resource: { buffer: this.visibleBuffer } },
-        { binding: 3, resource: { buffer: buffers.indices } },
-        { binding: 4, resource: { buffer: buffers.positions } },
-        { binding: 5, resource: { buffer: buffers.normals } },
-        { binding: 6, resource: { buffer: buffers.uvs } },
-        { binding: 7, resource: this.sampler },
-        { binding: 8, resource: textures.baseColor.createView() },
-        { binding: 9, resource: textures.normalMap.createView() },
-        { binding: 10, resource: textures.metalRough.createView() },
-        { binding: 11, resource: this.envSampler },
-        { binding: 12, resource: this.env.specular.createView() },
-        { binding: 13, resource: this.env.sky.createView() },
-      ],
-    });
-  }
-
-  /** Uploads an equirect HDR and GGX-prefilters it into a mip per roughness step for reflections. */
-  setEnvironment(e: Environment) {
-    const d = this.device;
-    const levels = Math.floor(Math.log2(Math.max(e.width, e.height))) + 1;
-    const sky = d.createTexture({
-      size: [e.width, e.height],
-      format: 'rgba16float',
-      mipLevelCount: levels,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-    });
-    d.queue.writeTexture({ texture: sky }, e.pixels, { bytesPerRow: e.width * 8 }, [e.width, e.height]);
-    this.generateMips(sky, 'rgba16float', levels);
-
-    const w = Math.min(512, e.width);
-    const specular = d.createTexture({
-      size: [w, Math.max(1, w / 2)],
-      format: 'rgba16float',
-      mipLevelCount: REFLECTION_LEVELS,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
-    });
-    const enc = d.createCommandEncoder();
-    const params: GPUBuffer[] = [];
-    for (let level = 0; level < REFLECTION_LEVELS; level++) {
-      const buf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      const roughness = level / (REFLECTION_LEVELS - 1);
-      d.queue.writeBuffer(buf, 0, new Float32Array([roughness, (4 * Math.PI) / (e.width * e.height), levels, 0]));
-      params.push(buf);
-      const pass = enc.beginRenderPass({
-        colorAttachments: [{ view: specular.createView({ baseMipLevel: level, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store' }],
-      });
-      pass.setPipeline(this.prefilterPipeline);
-      pass.setBindGroup(
-        0,
-        d.createBindGroup({
-          layout: this.prefilterPipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: sky.createView() },
-            { binding: 1, resource: this.envSampler },
-            { binding: 2, resource: { buffer: buf } },
-          ],
-        }),
-      );
-      pass.draw(3);
-      pass.end();
-    }
-    d.queue.submit([enc.finish()]);
-    d.queue.onSubmittedWorkDone().then(() => params.forEach((b) => b.destroy()));
-
-    this.env.sky.destroy();
-    this.env.specular.destroy();
-    this.env = { sky, specular, sh: e.sh, maxLod: REFLECTION_LEVELS - 1 };
-    if (this.scene) this.scene.drawBindGroup = this.drawBindGroup(this.scene.buffers, this.scene.textures);
   }
 
   /** Uploads an image with a full mip chain, or a 1x1 texture of `fallback` when there's no image. */
@@ -369,13 +265,8 @@ export class Renderer {
     });
     d.queue.copyExternalImageToTexture({ source: img }, { texture: t }, [img.width, img.height]);
     img.close();
-    this.generateMips(t, format, levels);
-    return t;
-  }
 
-  /** Each level is a linear-filtered blit of the previous one (sRGB formats filter in linear space). */
-  private generateMips(t: GPUTexture, format: GPUTextureFormat, levels: number) {
-    const d = this.device;
+    // Each level is a linear-filtered blit of the previous one (sRGB formats filter in linear space).
     let pipeline = this.mipPipelines.get(format);
     if (!pipeline) {
       pipeline = d.createRenderPipeline({
@@ -403,6 +294,7 @@ export class Renderer {
       pass.end();
     }
     d.queue.submit([enc.finish()]);
+    return t;
   }
 
   private ensureTargets() {
@@ -447,10 +339,6 @@ export class Renderer {
     f[56] = m?.metallic ?? 0;
     f[57] = m?.roughness ?? 1;
     f[58] = m?.normalScale ?? 1;
-    f.set(invert(p.viewProj), 60);
-    f.set(this.env.sh, 76);
-    f[112] = EXPOSURE;
-    f[113] = this.env.maxLod;
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
     d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));
@@ -485,12 +373,8 @@ export class Renderer {
       timestampWrites: ts ? { querySet: ts.querySet, beginningOfPassWriteIndex: 2, endOfPassWriteIndex: 3 } : undefined,
     });
     if (s) {
-      rp.setBindGroup(0, s.drawBindGroup);
-      if (p.viewMode === 3) {
-        rp.setPipeline(this.skyPipeline);
-        rp.draw(3);
-      }
       rp.setPipeline(this.drawPipeline);
+      rp.setBindGroup(0, s.drawBindGroup);
       rp.drawIndirect(this.drawArgsBuffer, 0);
     }
     rp.end();

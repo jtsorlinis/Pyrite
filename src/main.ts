@@ -2,7 +2,6 @@ import { Renderer, type GpuStats } from './renderer';
 import { OrbitCamera } from './camera';
 import { lookAt, multiply, perspectiveReversedInfinite } from './math';
 import { loadGltf, type MaterialInfo } from './loader';
-import { loadEnvironment } from './environment';
 import type { BuildResult, MeshInput } from './builder';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -10,7 +9,6 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 type Source = { kind: 'file'; file: File } | { kind: 'url'; url: string };
 
 const DEFAULT_MODEL = 'dragon.glb';
-const ENVIRONMENT = '/sunny.hdr'; // lighting + background for the Texture view
 
 const state = {
   viewMode: 1,
@@ -24,8 +22,6 @@ let camera: OrbitCamera;
 let model: BuildResult | null = null;
 let modelName = '';
 let materialSummary = { maps: '', sizes: '', bytes: 0, textured: false };
-let environmentName = 'none';
-let environmentReady: Promise<void> = Promise.resolve();
 
 main();
 
@@ -40,12 +36,6 @@ async function main() {
   }
   camera = new OrbitCamera(canvas);
   renderer.onStats = onStats;
-  environmentReady = loadEnvironment(ENVIRONMENT)
-    .then((env) => {
-      renderer.setEnvironment(env);
-      environmentName = env.name;
-    })
-    .catch((e) => console.warn(`No environment lighting: ${(e as Error).message}`));
   bindUi();
   const files = await listProjectModels();
 
@@ -134,7 +124,6 @@ async function loadModel(src: Source) {
     if (my !== jobId) return;
     setProgress('Decoding textures', 1);
     const material = await mesh.material;
-    await environmentReady;
     if (my !== jobId) return;
     materialSummary = summarizeMaterial(material, mesh.materialCount);
     renderer.setScene(result, material);
@@ -196,9 +185,9 @@ async function listProjectModels(): Promise<string[]> {
 function summarizeMaterial(mat: MaterialInfo | null, count: number) {
   if (!mat) return { maps: `${count} materials (unsupported)`, sizes: '', bytes: 0, textured: false };
   const slots: [string, ImageBitmap | null][] = [
-    ['base', mat.baseColor],
+    ['colour', mat.baseColor],
     ['normal', mat.normal],
-    ['metal/rough', mat.metallicRoughness],
+    ['rough', mat.metallicRoughness],
   ];
   const present = slots.filter(([, b]) => b);
   const bytes = present.reduce((sum, [, b]) => sum + (b!.width * b!.height * 4 * 4) / 3, 0);
@@ -222,7 +211,6 @@ function onModelLoaded() {
     ['DAG triangles', `${fmt(dagTris)} (${(dagTris / m.sourceTriangles).toFixed(2)}×)`],
     ['Mesh memory', mb(geometryBytes)],
     ['Textures', materialSummary.maps],
-    ['Environment', environmentName],
   ];
   if (materialSummary.bytes) rows.push(['Texture memory', `${mb(materialSummary.bytes)} · ${materialSummary.sizes}`]);
   rows.push(['Build time', `${(m.buildMs / 1000).toFixed(2)} s`]);

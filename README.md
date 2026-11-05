@@ -7,7 +7,7 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on startup. Any other `.glb` in the project folder (or `models/`) also gets a button, and you can drag and drop a file, use **Open .glb…**, or pass `?model=/path.glb`. `sunny.hdr` in the project folder lights the Texture view and is drawn behind it; without it, that view falls back to flat grey light.
+Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on startup. Any other `.glb` in the project folder (or `models/`) also gets a button, and you can drag and drop a file, use **Open .glb…**, or pass `?model=/path.glb`.
 
 ## Things to try
 
@@ -34,7 +34,7 @@ Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on s
 
 - **Compute pass**: one thread per (cluster, instance). A cluster is drawn when `projectedError(lod) <= threshold < projectedError(parent)`. A parent and its children read exactly the same stored values, so the selected cut never overlaps or leaves holes, and no tree traversal is needed. The same pass does frustum culling and appends survivors to a visible list plus indirect draw args.
 - **Draw**: a single `drawIndirect` with one instance per visible cluster and 384 vertices each. The vertex shader pulls indices, positions, normals and UVs from storage buffers, and triangles beyond a cluster's count collapse to nothing. The debug views shade flat facets from screen-space derivatives.
-- **Texture view**: glTF metallic-roughness shading lit only by the HDR environment (image-based lighting), with ACES tone mapping. Diffuse light comes from the HDR projected to 9 spherical-harmonic coefficients on the CPU. Reflections sample a copy of the HDR that the GPU blurs with GGX importance sampling, one mip per roughness step, combined with an analytic split-sum BRDF fit. Textures are uploaded with a generated mip chain and capped at 4096 px. The normal map's tangent frame is built from screen-space derivatives, so no tangents are stored and simplification can't break them.
+- **Texture view**: glTF metallic-roughness shading (Lambert + GGX, one sun plus sky light, ACES tone mapping). Textures are uploaded with a generated mip chain and capped at 4096 px. The normal map's tangent frame is built from screen-space derivatives, so no tangents are stored and simplification can't break them.
 
 The builder was checked offline: simulated cuts on closed test meshes with UV seams have zero open edges, which means no cracks.
 
@@ -50,4 +50,3 @@ These parts of real Nanite are missing:
 - **Streaming**: everything is resident on the GPU.
 - **Cached build**: the DAG is rebuilt on every load, and multi-mesh scenes are flattened into one mesh.
 - **Multiple materials**: texturing needs a model with a single material; other models still get the debug views. Emissive, occlusion, alpha and KTX2 textures are ignored.
-- **Shadows**: the environment lights every surface as if nothing blocks it, so there's no self-shadowing or ambient occlusion.
