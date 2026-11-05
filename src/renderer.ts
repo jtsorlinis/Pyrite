@@ -27,6 +27,7 @@ export interface GpuStats {
 
 const UNIFORM_SIZE = 464;
 const EXPOSURE = 1.0;
+const BACKGROUND_BLUR = 0.5; // 0..1, like three.js' backgroundBlurriness
 const REFLECTION_LEVELS = 6; // prefiltered roughness steps: 0, 0.2, ... 1
 const STATS_SIZE = 16 + 32 * 4;
 const SAMPLES = 4;
@@ -451,6 +452,7 @@ export class Renderer {
     f.set(this.env.sh, 76);
     f[112] = EXPOSURE;
     f[113] = this.env.maxLod;
+    f[114] = BACKGROUND_BLUR;
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
     d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));

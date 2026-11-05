@@ -29,7 +29,7 @@ struct Uniforms {
   sh: array<vec4f, 9>,  // environment irradiance / PI, spherical harmonics
   exposure: f32,
   envMaxLod: f32,       // roughness 1 maps to this reflection mip
-  pad1: f32,
+  backgroundBlur: f32,  // 0 = sharp HDR, 1 = as blurry as a fully rough reflection
   pad2: f32,
 };
 
@@ -331,7 +331,13 @@ fn skyVs(@builtin(vertex_index) i: u32) -> SkyOut {
 fn skyFs(in: SkyOut) -> @location(0) vec4f {
   let h = u.invViewProj * vec4f(in.ndc, 1.0, 1.0); // a point on the near plane
   let d = normalize(h.xyz / h.w - u.camPos.xyz);
-  let c = tonemap(textureSampleLevel(envSky, envSampler, equirectUv(d), 0.0).rgb * u.exposure);
+  // Blur reuses the GGX-prefiltered reflection mips, so it's smooth and costs nothing extra.
+  let uv = equirectUv(d);
+  var hdr = textureSampleLevel(envSky, envSampler, uv, 0.0).rgb;
+  if (u.backgroundBlur > 0.0) {
+    hdr = textureSampleLevel(envSpecular, envSampler, uv, u.backgroundBlur * u.envMaxLod).rgb;
+  }
+  let c = tonemap(hdr * u.exposure);
   return vec4f(pow(clamp(c, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0);
 }
 `;
