@@ -118,6 +118,11 @@ button:disabled {
   padding: 4px 7px;
   color: var(--muted);
 }
+/* Four quality levels don't fit on one line at this panel width: lay them out 2 x 2. */
+#quality {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
 .seg button.on {
   background: rgba(124, 196, 255, 0.18);
   color: var(--text);
