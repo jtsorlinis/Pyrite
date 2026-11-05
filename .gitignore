@@ -3,3 +3,4 @@ dist
 *.glb
 *.gltf
 *.hdr
+.DS_Store
