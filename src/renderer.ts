@@ -339,6 +339,7 @@ export class Renderer {
     f[56] = m?.metallic ?? 0;
     f[57] = m?.roughness ?? 1;
     f[58] = m?.normalScale ?? 1;
+    u[59] = p.threshold <= 0 ? 1 : 0; // a threshold of 0 means Full: LOD selection off
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
     d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));

@@ -22,7 +22,7 @@ struct Uniforms {
   metallicFactor: f32,
   roughnessFactor: f32,
   normalScale: f32,
-  pad: f32,
+  fullDetail: u32,    // 1 = Nanite off: draw the original mesh (every level-0 cluster)
 };
 
 struct Cluster {
@@ -107,9 +107,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
     // The Nanite cut: draw me if I'm accurate enough but my parent group isn't.
     // Both sides use the exact same (sphere, error) values stored on parent and child,
     // so siblings and cousins always agree and the cut never has holes or overlaps.
-    let ownOk = projectedError(c.lodBounds, c.lodError, off) <= u.threshold;
-    let parentTooCoarse = c.parentLevel == ROOT || projectedError(c.parentBounds, c.parentError, off) > u.threshold;
-    draw = ownOk && parentTooCoarse && inFrustum(c.bounds, off);
+    var selected: bool;
+    if (u.fullDetail != 0u) {
+      selected = c.level == 0u;
+    } else {
+      let ownOk = projectedError(c.lodBounds, c.lodError, off) <= u.threshold;
+      let parentTooCoarse = c.parentLevel == ROOT || projectedError(c.parentBounds, c.parentError, off) > u.threshold;
+      selected = ownOk && parentTooCoarse;
+    }
+    draw = selected && inFrustum(c.bounds, off);
     triCount = c.triCount;
     level = c.level;
   }

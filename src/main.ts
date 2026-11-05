@@ -282,7 +282,7 @@ function bindUi() {
   };
 
   const modes = segmented('view-mode', (v) => (state.viewMode = v));
-  segmented('quality', (v) => (state.threshold = v)); // max projected error, pixels
+  segmented('quality', (v) => (state.threshold = v)); // max projected error in pixels; 0 = Full (no LOD)
 
   const grid = $<HTMLInputElement>('grid');
   grid.oninput = () => {
