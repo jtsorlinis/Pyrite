@@ -1,4 +1,6 @@
-# Virtual Geometry (Nanite-style) in WebGPU
+# Pyrite
+
+Virtual geometry (Nanite-style) in WebGPU. Fool's Nanite, if you like.
 
 Loads a `.glb`, builds a Nanite-style cluster DAG in the browser, and every frame picks, per cluster and on the GPU, the coarsest geometry whose simplification error stays under ~1 pixel, optionally capped to a triangle budget. It's shown with the model's own textures, or with every triangle flat-coloured so you can watch the selection change as you move.
 
