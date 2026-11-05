@@ -7,7 +7,7 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on startup. Any other `.glb` in the project folder (or `models/`) also gets a button, and you can drag and drop a file, use **Open .glb…**, or pass `?model=/path.glb`. `sunny.hdr` in the project folder lights the Texture view and is drawn behind it, 50% blurred (`BACKGROUND_BLUR` in `src/renderer.ts`); without it, that view falls back to flat grey light.
+Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on startup. Any other `.glb` in the project folder (or `models/`) also gets a button, and you can drag and drop a file, use **Open .glb…**, or pass `?model=/path.glb`. `sunny.hdr` in the project folder lights the Texture view and is drawn behind it; without it, that view falls back to flat grey light.
 
 ## Things to try
 
