@@ -55,13 +55,14 @@
               <button data-v="2">Medium (2px)</button>
               <button data-v="1" class="on">High (1px)</button>
             </div>
-            <span class="sub-label">Triangle cap</span>
-            <div class="seg" id="budget">
-              <button data-v="0">Off</button>
-              <button data-v="250000">250K</button>
-              <button data-v="500000">500K</button>
-              <button data-v="1000000" class="on">1M</button>
-              <button data-v="2000000">2M</button>
+            <label class="sub-label check"><input type="checkbox" id="cap" autocomplete="off" /> Triangle cap</label>
+            <div id="cap-options" hidden>
+              <div class="seg" id="budget">
+                <button data-v="250000">250K</button>
+                <button data-v="500000">500K</button>
+                <button data-v="1000000" class="on">1M</button>
+                <button data-v="2000000">2M</button>
+              </div>
             </div>
           </div>
         </div>

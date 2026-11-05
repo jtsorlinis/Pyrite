@@ -219,6 +219,16 @@ button:disabled {
 .field .sub-label {
   margin-top: 8px;
 }
+.field .check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.check input {
+  margin: 0;
+  accent-color: var(--accent);
+}
 .slider span {
   display: flex;
   justify-content: space-between;

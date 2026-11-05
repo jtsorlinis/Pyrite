@@ -14,7 +14,8 @@ const state = {
   viewMode: 0,
   nanite: true, // off = draw the original mesh with no LOD
   threshold: 1, // max projected error in pixels while Nanite is on
-  budget: 1_000_000, // triangle cap (0 = none): the GPU raises the error just enough to fit
+  cap: false, // triangle cap on: the GPU raises the error just enough to fit the budget
+  budget: 1_000_000, // the cap's size, used only while it's on
   grid: 1,
 };
 
@@ -68,7 +69,7 @@ function frame(t: number) {
     fovY: camera.fovY,
     nanite: state.nanite,
     threshold: state.threshold,
-    budget: state.budget,
+    budget: state.cap ? state.budget : 0,
     viewMode: state.viewMode,
     gridSize: state.grid,
     spacing: spacing(),
@@ -274,7 +275,7 @@ function onStats(s: GpuStats) {
   }
   const of = $('overflow');
   of.hidden = !s.overflow;
-  const fix = state.nanite ? 'Lower the quality or set a triangle cap.' : 'Enable Nanite or use fewer instances.';
+  const fix = state.nanite ? 'Lower the quality or turn on the triangle cap.' : 'Enable Nanite or use fewer instances.';
   if (s.overflow) of.textContent = `Visible list full: ${fmt(s.overflow)} clusters dropped. ${fix}`;
 }
 
@@ -292,6 +293,12 @@ function bindUi() {
   const modes = segmented('view-mode', (v) => (state.viewMode = v));
   segmented('quality', (v) => (state.threshold = v));
   segmented('budget', (v) => (state.budget = v));
+  const cap = $<HTMLInputElement>('cap');
+  cap.checked = state.cap; // don't let the browser restore a stale checkbox state on reload
+  cap.onchange = () => {
+    state.cap = cap.checked;
+    $('cap-options').hidden = !state.cap;
+  };
   const nanite = $<HTMLButtonElement>('nanite');
   nanite.onclick = () => {
     state.nanite = !state.nanite;
