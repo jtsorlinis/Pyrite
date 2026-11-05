@@ -11,7 +11,7 @@ type Source = { kind: 'file'; file: File } | { kind: 'url'; url: string };
 const DEFAULT_MODEL = 'dragon.glb';
 
 const state = {
-  viewMode: 1,
+  viewMode: 0,
   threshold: 1,
   grid: 1,
 };
@@ -218,10 +218,10 @@ function onModelLoaded() {
     .map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(v)}</dd>`)
     .join('');
 
-  const texButton = $('view-mode').querySelector<HTMLButtonElement>('[data-v="3"]')!;
+  const texButton = $('view-mode').querySelector<HTMLButtonElement>('[data-v="0"]')!;
   texButton.disabled = !materialSummary.textured;
   texButton.title = materialSummary.textured ? '' : 'Texturing supports models with a single material';
-  if (texButton.disabled && state.viewMode === 3) $('view-mode').querySelector<HTMLButtonElement>('button')!.click();
+  if (texButton.disabled && state.viewMode === 0) $('view-mode').querySelector<HTMLButtonElement>('[data-v="1"]')!.click();
 
   const bars = $('levels');
   bars.innerHTML = '';
@@ -294,7 +294,7 @@ function bindUi() {
     if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.code === 'KeyR') reframe();
-    else if (/^Digit[1-4]$/.test(e.code)) modes[Number(e.code.slice(5)) - 1].click();
+    else if (/^Digit[1-2]$/.test(e.code)) modes[Number(e.code.slice(5)) - 1].click();
   });
 
   // Drag & drop

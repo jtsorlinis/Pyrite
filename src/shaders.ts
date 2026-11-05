@@ -16,7 +16,7 @@ struct Uniforms {
   spacing: f32,       // instance grid spacing
   numClusters: u32,
   gridSize: u32,
-  viewMode: u32,      // 0 = cluster, 1 = triangle, 2 = plain, 3 = textured
+  viewMode: u32,      // 0 = textured, 1 = triangle colours
   capacity: u32,      // size of the visible list
   baseColorFactor: vec4f,
   metallicFactor: f32,
@@ -207,7 +207,7 @@ fn idColor(id: u32) -> vec3f {
   return hsv(f32(h & 0xffffu) / 65535.0, 0.45 + 0.4 * f32((h >> 16u) & 0xffu) / 255.0, 0.7 + 0.3 * f32(h >> 24u) / 255.0);
 }
 
-// Debug views: flat-shaded facets so each triangle and cluster is visible.
+// Triangle view: flat-shaded facets, one colour per triangle, so LOD changes are visible.
 fn shadeFlat(in: VSOut, base: vec3f) -> vec3f {
   var n = normalize(cross(dpdx(in.world), dpdy(in.world)));
   let v = normalize(u.camPos.xyz - in.world);
@@ -279,11 +279,10 @@ fn shadeTextured(in: VSOut, front: bool) -> vec3f {
 @fragment
 fn fs(in: VSOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   var color: vec3f;
-  switch u.viewMode {
-    case 0u: { color = shadeFlat(in, idColor(in.ids.x * 7919u + 1u)); }
-    case 1u: { color = shadeFlat(in, idColor(in.ids.x * 131071u + in.ids.y * 7u + 3u)); }
-    case 3u: { color = shadeTextured(in, front); }
-    default: { color = shadeFlat(in, vec3f(0.75, 0.74, 0.72)); }
+  if (u.viewMode == 0u) {
+    color = shadeTextured(in, front);
+  } else {
+    color = shadeFlat(in, idColor(in.ids.x * 131071u + in.ids.y * 7u + 3u));
   }
   return vec4f(pow(clamp(color, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0);
 }
