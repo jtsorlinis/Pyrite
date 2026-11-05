@@ -3,6 +3,7 @@
 //         culling, and appends survivors to a visible list + indirect draw args.
 //   draw: vertex pulling. One instance per visible cluster, 128*3 vertices per instance;
 //         triangles past the cluster's count collapse to nothing.
+//   mip:  fullscreen blit used to build texture mip chains (WebGPU has no generateMipmap).
 
 const common = /* wgsl */ `
 struct Uniforms {
@@ -15,8 +16,13 @@ struct Uniforms {
   spacing: f32,       // instance grid spacing
   numClusters: u32,
   gridSize: u32,
-  viewMode: u32,      // 0 = cluster, 1 = triangle, 2 = plain
+  viewMode: u32,      // 0 = cluster, 1 = triangle, 2 = plain, 3 = textured
   capacity: u32,      // size of the visible list
+  baseColorFactor: vec4f,
+  metallicFactor: f32,
+  roughnessFactor: f32,
+  normalScale: f32,
+  pad: f32,
 };
 
 struct Cluster {
@@ -140,11 +146,19 @@ ${common}
 @group(0) @binding(2) var<storage, read> visible: array<vec2u>;
 @group(0) @binding(3) var<storage, read> indices: array<u32>;
 @group(0) @binding(4) var<storage, read> positions: array<f32>;
+@group(0) @binding(5) var<storage, read> normals: array<f32>;
+@group(0) @binding(6) var<storage, read> uvs: array<f32>;
+@group(0) @binding(7) var samp: sampler;
+@group(0) @binding(8) var baseColorTex: texture_2d<f32>;
+@group(0) @binding(9) var normalTex: texture_2d<f32>;
+@group(0) @binding(10) var metalRoughTex: texture_2d<f32>;
 
 struct VSOut {
   @builtin(position) pos: vec4f,
   @location(0) world: vec3f,
   @location(1) @interpolate(flat) ids: vec2u, // cluster, triangle
+  @location(2) normal: vec3f,
+  @location(3) uv: vec2f,
 };
 
 @vertex
@@ -165,8 +179,13 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   out.pos = u.viewProj * vec4f(p, 1.0);
   out.world = p;
   out.ids = vec2u(entry.x, tri);
+  out.normal = vec3f(normals[v * 3u], normals[v * 3u + 1u], normals[v * 3u + 2u]);
+  out.uv = vec2f(uvs[v * 2u], uvs[v * 2u + 1u]);
   return out;
 }
+
+const PI = 3.14159265;
+const SUN_DIR = vec3f(0.4558, 0.8103, 0.3546); // normalize(0.45, 0.8, 0.35)
 
 fn hash(x: u32) -> u32 {
   var h = x;
@@ -188,28 +207,108 @@ fn idColor(id: u32) -> vec3f {
   return hsv(f32(h & 0xffffu) / 65535.0, 0.45 + 0.4 * f32((h >> 16u) & 0xffu) / 255.0, 0.7 + 0.3 * f32(h >> 24u) / 255.0);
 }
 
-@fragment
-fn fs(in: VSOut) -> @location(0) vec4f {
-  // Flat face normal from screen-space derivatives (no vertex normals needed).
+// Debug views: flat-shaded facets so each triangle and cluster is visible.
+fn shadeFlat(in: VSOut, base: vec3f) -> vec3f {
   var n = normalize(cross(dpdx(in.world), dpdy(in.world)));
   let v = normalize(u.camPos.xyz - in.world);
   if (dot(n, v) < 0.0) {
     n = -n;
   }
-
-  var base: vec3f;
-  switch u.viewMode {
-    case 0u: { base = idColor(in.ids.x * 7919u + 1u); }
-    case 1u: { base = idColor(in.ids.x * 131071u + in.ids.y * 7u + 3u); }
-    default: { base = vec3f(0.75, 0.74, 0.72); }
-  }
   let albedo = pow(base, vec3f(2.2));
-
-  let sunDir = normalize(vec3f(0.45, 0.8, 0.35));
-  let diffuse = max(dot(n, sunDir), 0.0);
+  let diffuse = max(dot(n, SUN_DIR), 0.0);
   let hemi = mix(vec3f(0.05, 0.045, 0.04), vec3f(0.12, 0.14, 0.18), n.y * 0.5 + 0.5);
   let head = max(dot(n, v), 0.0);
-  let color = albedo * (hemi + diffuse * vec3f(0.95, 0.9, 0.82) + head * 0.18);
-  return vec4f(pow(color, vec3f(1.0 / 2.2)), 1.0);
+  return albedo * (hemi + diffuse * vec3f(0.95, 0.9, 0.82) + head * 0.18);
+}
+
+// Tangent frame from screen-space derivatives ("normal mapping without precomputed tangents"),
+// so the mesh needs no tangent attribute and simplification can't break one.
+fn perturbNormal(n: vec3f, p: vec3f, uv: vec2f, tn: vec3f) -> vec3f {
+  let dp1 = dpdx(p);
+  let dp2 = dpdy(p);
+  let duv1 = dpdx(uv);
+  let duv2 = dpdy(uv);
+  let dp2perp = cross(dp2, n);
+  let dp1perp = cross(n, dp1);
+  let t = dp2perp * duv1.x + dp1perp * duv2.x;
+  let b = dp2perp * duv1.y + dp1perp * duv2.y;
+  let invmax = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-30));
+  return normalize(mat3x3f(t * invmax, b * invmax, n) * tn);
+}
+
+// glTF metallic-roughness: Lambert diffuse + GGX specular from one sun, plus hemisphere ambient.
+fn shadeTextured(in: VSOut, front: bool) -> vec3f {
+  let base = textureSample(baseColorTex, samp, in.uv) * u.baseColorFactor; // linear (sRGB texture)
+  let mr = textureSample(metalRoughTex, samp, in.uv);
+  var tn = textureSample(normalTex, samp, in.uv).xyz * 2.0 - 1.0;
+  // glTF normal maps are +Y up in the image, but our frame's bitangent points along +v (image down).
+  tn = vec3f(tn.x * u.normalScale, -tn.y * u.normalScale, tn.z);
+
+  var ng = normalize(in.normal);
+  if (!front) {
+    ng = -ng; // double-sided: light the back of a face from its own side
+  }
+  let n = perturbNormal(ng, in.world, in.uv, tn);
+  let v = normalize(u.camPos.xyz - in.world);
+  let rough = clamp(mr.g * u.roughnessFactor, 0.045, 1.0);
+  let metal = clamp(mr.b * u.metallicFactor, 0.0, 1.0);
+
+  let h = normalize(SUN_DIR + v);
+  let nl = max(dot(n, SUN_DIR), 0.0);
+  let nv = max(dot(n, v), 1e-4);
+  let nh = max(dot(n, h), 0.0);
+  let vh = max(dot(v, h), 0.0);
+  let a2 = pow(rough, 4.0);
+  let dd = nh * nh * (a2 - 1.0) + 1.0;
+  let d = a2 / (PI * dd * dd);
+  let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+  let g = (nl / (nl * (1.0 - k) + k)) * (nv / (nv * (1.0 - k) + k));
+  let f0 = mix(vec3f(0.04), base.rgb, metal);
+  let f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+  let spec = d * g * f / max(4.0 * nl * nv, 1e-4);
+  let diffuse = (1.0 - f) * (1.0 - metal) * base.rgb / PI;
+  let sun = vec3f(1.0, 0.96, 0.9) * 3.2;
+
+  let sky = mix(vec3f(0.07, 0.06, 0.05), vec3f(0.2, 0.23, 0.28), n.y * 0.5 + 0.5);
+  let ambient = sky * (base.rgb * (1.0 - metal) + f0 * (1.0 - rough * 0.7));
+  let fill = base.rgb * (1.0 - metal) * nv * 0.12; // soft headlight so the shadow side keeps detail
+  let c = (diffuse + spec) * sun * nl + ambient + fill;
+  return c * (2.51 * c + 0.03) / (c * (2.43 * c + 0.59) + 0.14); // ACES (Narkowicz fit)
+}
+
+@fragment
+fn fs(in: VSOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  var color: vec3f;
+  switch u.viewMode {
+    case 0u: { color = shadeFlat(in, idColor(in.ids.x * 7919u + 1u)); }
+    case 1u: { color = shadeFlat(in, idColor(in.ids.x * 131071u + in.ids.y * 7u + 3u)); }
+    case 3u: { color = shadeTextured(in, front); }
+    default: { color = shadeFlat(in, vec3f(0.75, 0.74, 0.72)); }
+  }
+  return vec4f(pow(clamp(color, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0);
+}
+`;
+
+export const mipShader = /* wgsl */ `
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct VOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VOut {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)); // fullscreen triangle
+  var o: VOut;
+  o.pos = vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  o.uv = vec2f(p.x, 1.0 - p.y);
+  return o;
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4f {
+  return textureSampleLevel(src, samp, in.uv, 0.0);
 }
 `;

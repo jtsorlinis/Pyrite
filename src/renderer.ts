@@ -1,8 +1,9 @@
 // WebGPU renderer: GPU cluster selection (compute) + indirect vertex-pulled draw.
 
 import { MAX_CLUSTER_TRIS, type BuildResult } from './builder';
+import type { MaterialInfo } from './loader';
 import { frustumPlanes, type Mat4, type Vec3 } from './math';
-import { cullShader, drawShader } from './shaders';
+import { cullShader, drawShader, mipShader } from './shaders';
 
 export interface FrameParams {
   viewProj: Mat4;
@@ -23,15 +24,15 @@ export interface GpuStats {
   gpuDrawMs: number | null;
 }
 
-const UNIFORM_SIZE = 208;
+const UNIFORM_SIZE = 240;
 const STATS_SIZE = 16 + 32 * 4;
 const SAMPLES = 4;
 const READBACK_SIZE = 16 + STATS_SIZE + 32; // draw args + stats + 4 timestamps
 
 interface Scene {
-  clusterBuffer: GPUBuffer;
-  indexBuffer: GPUBuffer;
-  positionBuffer: GPUBuffer;
+  buffers: GPUBuffer[];
+  textures: GPUTexture[];
+  material: { baseColorFactor: number[]; metallic: number; roughness: number; normalScale: number };
   cullBindGroup: GPUBindGroup;
   drawBindGroup: GPUBindGroup;
   numClusters: number;
@@ -58,6 +59,10 @@ export class Renderer {
   private uniformData = new ArrayBuffer(UNIFORM_SIZE);
   private context: GPUCanvasContext;
   private timing: { querySet: GPUQuerySet; resolve: GPUBuffer } | null = null;
+  private sampler: GPUSampler;
+  private mipSampler: GPUSampler;
+  private mipModule: GPUShaderModule;
+  private mipPipelines = new Map<GPUTextureFormat, GPURenderPipeline>();
 
   static async create(canvas: HTMLCanvasElement): Promise<Renderer> {
     if (!navigator.gpu) throw new Error('WebGPU is not available in this browser.');
@@ -88,7 +93,8 @@ export class Renderer {
     this.capacity = Math.min(Math.floor(limit / 8), 1 << 22);
 
     const C = GPUShaderStage.COMPUTE;
-    const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    const V = GPUShaderStage.VERTEX;
+    const F = GPUShaderStage.FRAGMENT;
     this.cullLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: C, buffer: { type: 'uniform' } },
@@ -100,17 +106,24 @@ export class Renderer {
     });
     this.drawLayout = device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: VF, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
-        { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+        { binding: 0, visibility: V | F, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: V, buffer: { type: 'read-only-storage' } }, // clusters
+        { binding: 2, visibility: V, buffer: { type: 'read-only-storage' } }, // visible list
+        { binding: 3, visibility: V, buffer: { type: 'read-only-storage' } }, // indices
+        { binding: 4, visibility: V, buffer: { type: 'read-only-storage' } }, // positions
+        { binding: 5, visibility: V, buffer: { type: 'read-only-storage' } }, // normals
+        { binding: 6, visibility: V, buffer: { type: 'read-only-storage' } }, // uvs
+        { binding: 7, visibility: F, sampler: { type: 'filtering' } },
+        { binding: 8, visibility: F, texture: { sampleType: 'float' } }, // base colour
+        { binding: 9, visibility: F, texture: { sampleType: 'float' } }, // normal map
+        { binding: 10, visibility: F, texture: { sampleType: 'float' } }, // metallic-roughness
       ],
     });
 
     const cullModule = device.createShaderModule({ code: cullShader, label: 'cull' });
     const drawModule = device.createShaderModule({ code: drawShader, label: 'draw' });
-    for (const m of [cullModule, drawModule]) {
+    this.mipModule = device.createShaderModule({ code: mipShader, label: 'mip' });
+    for (const m of [cullModule, drawModule, this.mipModule]) {
       m.getCompilationInfo().then((info) => {
         for (const msg of info.messages) console[msg.type === 'error' ? 'error' : 'warn'](`${m.label}:${msg.lineNum}:${msg.linePos} ${msg.message}`);
       });
@@ -145,6 +158,15 @@ export class Renderer {
         busy: false,
       });
     }
+    this.sampler = device.createSampler({
+      addressModeU: 'repeat',
+      addressModeV: 'repeat',
+      magFilter: 'linear',
+      minFilter: 'linear',
+      mipmapFilter: 'linear',
+      maxAnisotropy: 8,
+    });
+    this.mipSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     if (device.features.has('timestamp-query')) {
       this.timing = {
         querySet: device.createQuerySet({ type: 'timestamp', count: 4 }),
@@ -153,12 +175,11 @@ export class Renderer {
     }
   }
 
-  setScene(r: BuildResult) {
+  setScene(r: BuildResult, material: MaterialInfo | null) {
     const d = this.device;
     if (this.scene) {
-      this.scene.clusterBuffer.destroy();
-      this.scene.indexBuffer.destroy();
-      this.scene.positionBuffer.destroy();
+      for (const b of this.scene.buffers) b.destroy();
+      for (const t of this.scene.textures) t.destroy();
       this.scene = null;
     }
     const maxBinding = d.limits.maxStorageBufferBindingSize;
@@ -176,6 +197,13 @@ export class Renderer {
     const clusterBuffer = upload(r.clusters, 'clusters');
     const indexBuffer = upload(r.indices, 'indices');
     const positionBuffer = upload(r.positions, 'positions');
+    const normalBuffer = upload(r.normals, 'normals');
+    const uvBuffer = upload(r.uvs, 'uvs');
+
+    // Missing maps fall back to 1x1 textures that leave the factors unchanged.
+    const baseColor = this.texture(material?.baseColor ?? null, 'rgba8unorm-srgb', [255, 255, 255, 255]);
+    const normalMap = this.texture(material?.normal ?? null, 'rgba8unorm', [128, 128, 255, 255]);
+    const metalRough = this.texture(material?.metallicRoughness ?? null, 'rgba8unorm', [255, 255, 255, 255]);
 
     const cullBindGroup = d.createBindGroup({
       layout: this.cullLayout,
@@ -195,17 +223,78 @@ export class Renderer {
         { binding: 2, resource: { buffer: this.visibleBuffer } },
         { binding: 3, resource: { buffer: indexBuffer } },
         { binding: 4, resource: { buffer: positionBuffer } },
+        { binding: 5, resource: { buffer: normalBuffer } },
+        { binding: 6, resource: { buffer: uvBuffer } },
+        { binding: 7, resource: this.sampler },
+        { binding: 8, resource: baseColor.createView() },
+        { binding: 9, resource: normalMap.createView() },
+        { binding: 10, resource: metalRough.createView() },
       ],
     });
     this.scene = {
-      clusterBuffer,
-      indexBuffer,
-      positionBuffer,
+      buffers: [clusterBuffer, indexBuffer, positionBuffer, normalBuffer, uvBuffer],
+      textures: [baseColor, normalMap, metalRough],
+      material: {
+        baseColorFactor: material?.baseColorFactor ?? [1, 1, 1, 1],
+        // A mesh with no material at all gets a plain dielectric instead of glTF's default metal.
+        metallic: material ? material.metallicFactor : 0,
+        roughness: material ? material.roughnessFactor : 0.8,
+        normalScale: material?.normalScale ?? 1,
+      },
       cullBindGroup,
       drawBindGroup,
       numClusters: r.clusterCount,
       minDist: r.radius * 1e-6,
     };
+  }
+
+  /** Uploads an image with a full mip chain, or a 1x1 texture of `fallback` when there's no image. */
+  private texture(img: ImageBitmap | null, format: GPUTextureFormat, fallback: number[]): GPUTexture {
+    const d = this.device;
+    if (!img) {
+      const t = d.createTexture({ size: [1, 1], format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      d.queue.writeTexture({ texture: t }, new Uint8Array(fallback), { bytesPerRow: 4 }, [1, 1]);
+      return t;
+    }
+    const levels = Math.floor(Math.log2(Math.max(img.width, img.height))) + 1;
+    const t = d.createTexture({
+      size: [img.width, img.height],
+      format,
+      mipLevelCount: levels,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    d.queue.copyExternalImageToTexture({ source: img }, { texture: t }, [img.width, img.height]);
+    img.close();
+
+    // Each level is a linear-filtered blit of the previous one (sRGB formats filter in linear space).
+    let pipeline = this.mipPipelines.get(format);
+    if (!pipeline) {
+      pipeline = d.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: this.mipModule, entryPoint: 'vs' },
+        fragment: { module: this.mipModule, entryPoint: 'fs', targets: [{ format }] },
+      });
+      this.mipPipelines.set(format, pipeline);
+    }
+    const enc = d.createCommandEncoder();
+    for (let level = 1; level < levels; level++) {
+      const bg = d.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: t.createView({ baseMipLevel: level - 1, mipLevelCount: 1 }) },
+          { binding: 1, resource: this.mipSampler },
+        ],
+      });
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: t.createView({ baseMipLevel: level, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.draw(3);
+      pass.end();
+    }
+    d.queue.submit([enc.finish()]);
+    return t;
   }
 
   private ensureTargets() {
@@ -245,6 +334,11 @@ export class Renderer {
     u[49] = p.gridSize;
     u[50] = p.viewMode;
     u[51] = this.capacity;
+    const m = s?.material;
+    f.set(m?.baseColorFactor ?? [1, 1, 1, 1], 52);
+    f[56] = m?.metallic ?? 0;
+    f[57] = m?.roughness ?? 1;
+    f[58] = m?.normalScale ?? 1;
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
     d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));

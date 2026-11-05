@@ -1,6 +1,8 @@
 // Offline (load-time) construction of a Nanite-style cluster DAG.
 //
-//   1. Weld vertices by position (glTF splits vertices on UV/normal seams; we only care about shape).
+//   1. Weld vertices that share position + UV (normals are averaged). Vertices that share a
+//      position but not a UV are kept apart as a UV seam; topology (grouping, locking) is computed
+//      on positions, so seams never open up cracks.
 //   2. Split the mesh into clusters of <= 128 triangles (level 0).
 //   3. Repeat until one cluster is left (or nothing simplifies any more):
 //        - partition the current clusters into groups of ~8 adjacent clusters
@@ -22,6 +24,15 @@ const MAX_CLUSTER_VERTS = 128;
 const GROUP_SIZE = 8;
 const MAX_LEVELS = 64;
 const MIN_REDUCTION = 0.85; // a group must shrink to <= 85% of its triangles to count as simplified
+// Simplifier attribute weights for (nx, ny, nz, u, v). The returned error includes these terms, so
+// they're kept small: heavier weights make coarse levels look "wrong" and far-away LODs stop being
+// picked (2-4x the triangles at distance). UV seams are kept by the simplifier's topology rules.
+const ATTRIBUTE_WEIGHTS = [0.02, 0.02, 0.02, 0.05, 0.05];
+// Used only when a group can't shrink without crossing UV seams (near the top of the DAG). A heavy
+// UV weight there charges the texture smearing to the error, so those levels are picked only once
+// they're small on screen.
+const PERMISSIVE_WEIGHTS = [0.02, 0.02, 0.02, 0.5, 0.5];
+const ATTRIBUTES = 5;
 
 /** Each cluster is packed as 20 x 32-bit words (80 bytes), matching `struct Cluster` in the shaders. */
 export const CLUSTER_WORDS = 20;
@@ -33,8 +44,17 @@ export interface LevelInfo {
   triangles: number;
 }
 
+export interface MeshInput {
+  positions: Float32Array; // xyz
+  normals: Float32Array; // xyz
+  uvs: Float32Array; // uv
+  indices: Uint32Array;
+}
+
 export interface BuildResult {
   positions: Float32Array; // welded vertices, xyz
+  normals: Float32Array; // xyz
+  uvs: Float32Array; // uv
   indices: Uint32Array; // triangles of every cluster at every level, global vertex indices
   clusters: ArrayBuffer; // packed cluster records, CLUSTER_WORDS words each
   clusterCount: number;
@@ -91,14 +111,23 @@ class Scratch {
   }
 }
 
-const EMPTY_ATTRIBS = new Float32Array(0);
+/** Welded mesh: per-vertex attributes plus `canon`, the first vertex sharing each one's position. */
+interface Welded {
+  positions: Float32Array;
+  normals: Float32Array;
+  uvs: Float32Array;
+  attribs: Float32Array; // interleaved simplifier attributes, ATTRIBUTES floats per vertex
+  canon: Uint32Array;
+  indices: Uint32Array;
+}
 
-export async function buildDag(srcPositions: Float32Array, srcIndices: Uint32Array, progress: ProgressFn): Promise<BuildResult> {
+export async function buildDag(input: MeshInput, progress: ProgressFn): Promise<BuildResult> {
   await Promise.all([MeshoptClusterizer.ready, MeshoptSimplifier.ready]);
   const t0 = performance.now();
 
   progress('Welding vertices', 0);
-  const { positions, indices } = weld(srcPositions, srcIndices);
+  const mesh = weld(input);
+  const { positions, indices } = mesh;
   const vertexCount = positions.length / 3;
   const sourceTriangles = indices.length / 3;
   if (sourceTriangles === 0) throw new Error('Mesh has no triangles');
@@ -142,7 +171,7 @@ export async function buildDag(srcPositions: Float32Array, srcIndices: Uint32Arr
   let level = 0;
 
   while (pending.length > 1 && level < MAX_LEVELS) {
-    const groups = partition(pending, clusters, S);
+    const groups = partition(pending, clusters, mesh.canon, S);
     const locked = S.locked;
     const next: number[] = [];
     let simplifiedAny = false;
@@ -152,7 +181,7 @@ export async function buildDag(srcPositions: Float32Array, srcIndices: Uint32Arr
       let memberTris = 0;
       for (const m of members) memberTris += clusters[m].tris.length / 3;
 
-      const result = simplifyGroup(members, clusters, positions, locked, maxError, S);
+      const result = simplifyGroup(members, clusters, mesh, locked, maxError, S);
       doneWork += memberTris;
       if ((gi & 63) === 0) {
         progress(`Level ${level + 1}: simplifying ${groups.length} groups`, 0.05 + 0.93 * Math.min(1, doneWork / expectedWork));
@@ -207,39 +236,91 @@ export async function buildDag(srcPositions: Float32Array, srcIndices: Uint32Arr
   }
 
   progress('Packing GPU buffers', 0.99);
-  return pack(clusters, positions, sourceTriangles, srcPositions.length / 3, center, radius, min, max, performance.now() - t0);
+  return pack(clusters, mesh, sourceTriangles, input.positions.length / 3, center, radius, min, max, performance.now() - t0);
 }
 
 // ---------------------------------------------------------------------------------------------
 
-function weld(pos: Float32Array, idx: Uint32Array): { positions: Float32Array; indices: Uint32Array } {
-  const remap = MeshoptSimplifier.generatePositionRemap(pos, 3);
+function weld(input: MeshInput): Welded {
+  const { positions: pos, normals: nrm, uvs: uv, indices: idx } = input;
   const n = pos.length / 3;
-  const newId = new Int32Array(n).fill(-1);
-  const outIdx = new Uint32Array(idx.length);
+  const pb = new Uint32Array(pos.buffer, pos.byteOffset, n * 3);
+  const ub = new Uint32Array(uv.buffer, uv.byteOffset, n * 2);
+  let cap = 1024;
+  while (cap < n * 2) cap *= 2;
+  const table = new Int32Array(cap).fill(-1); // hash slot -> a source vertex with that key
+  const newId = new Int32Array(n).fill(-1); // source vertex -> welded vertex
   const outPos = new Float32Array(n * 3);
+  const outNrm = new Float32Array(n * 3);
+  const outUv = new Float32Array(n * 2);
   let vc = 0;
-  let ic = 0;
+
+  // Vertices are numbered in first-use order, which keeps clusters' vertices close in memory.
   const id = (v: number): number => {
     let r = newId[v];
-    if (r < 0) {
-      r = newId[v] = vc++;
-      outPos[r * 3] = pos[v * 3];
-      outPos[r * 3 + 1] = pos[v * 3 + 1];
-      outPos[r * 3 + 2] = pos[v * 3 + 2];
+    if (r >= 0) return r;
+    let h = 0x9e3779b9;
+    for (const x of [pb[v * 3], pb[v * 3 + 1], pb[v * 3 + 2], ub[v * 2], ub[v * 2 + 1]]) {
+      h = Math.imul(h ^ x, 0x85ebca6b);
+      h ^= h >>> 13;
     }
+    h = Math.imul(h ^ (h >>> 16), 0xc2b2ae35);
+    h ^= h >>> 16;
+    for (let s = h & (cap - 1); ; s = (s + 1) & (cap - 1)) {
+      const o = table[s];
+      if (o < 0) {
+        table[s] = v;
+        r = vc++;
+        outPos.set(pos.subarray(v * 3, v * 3 + 3), r * 3);
+        outUv.set(uv.subarray(v * 2, v * 2 + 2), r * 2);
+        break;
+      }
+      if (
+        pb[o * 3] === pb[v * 3] && pb[o * 3 + 1] === pb[v * 3 + 1] && pb[o * 3 + 2] === pb[v * 3 + 2] &&
+        ub[o * 2] === ub[v * 2] && ub[o * 2 + 1] === ub[v * 2 + 1]
+      ) {
+        r = newId[o];
+        break;
+      }
+    }
+    newId[v] = r;
+    outNrm[r * 3] += nrm[v * 3];
+    outNrm[r * 3 + 1] += nrm[v * 3 + 1];
+    outNrm[r * 3 + 2] += nrm[v * 3 + 2];
     return r;
   };
+  const tmp = new Uint32Array(idx.length);
   for (let t = 0; t + 2 < idx.length; t += 3) {
-    const a = remap[idx[t]];
-    const b = remap[idx[t + 1]];
-    const c = remap[idx[t + 2]];
-    if (a === b || b === c || a === c) continue; // degenerate after welding
-    outIdx[ic++] = id(a);
-    outIdx[ic++] = id(b);
-    outIdx[ic++] = id(c);
+    tmp[t] = id(idx[t]);
+    tmp[t + 1] = id(idx[t + 1]);
+    tmp[t + 2] = id(idx[t + 2]);
   }
-  return { positions: outPos.slice(0, vc * 3), indices: outIdx.slice(0, ic) };
+
+  const positions = outPos.slice(0, vc * 3);
+  const normals = outNrm.slice(0, vc * 3);
+  const uvs = outUv.slice(0, vc * 2);
+  const attribs = new Float32Array(vc * ATTRIBUTES);
+  for (let v = 0; v < vc; v++) {
+    const x = normals[v * 3], y = normals[v * 3 + 1], z = normals[v * 3 + 2];
+    const l = Math.hypot(x, y, z) || 1;
+    normals[v * 3] = x / l;
+    normals[v * 3 + 1] = y / l;
+    normals[v * 3 + 2] = z / l;
+    attribs.set([x / l, y / l, z / l, uvs[v * 2], uvs[v * 2 + 1]], v * ATTRIBUTES);
+  }
+
+  // Topology works on positions: drop triangles that are degenerate in space.
+  const canon = MeshoptSimplifier.generatePositionRemap(positions, 3);
+  const indices = new Uint32Array(tmp.length);
+  let ic = 0;
+  for (let t = 0; t + 2 < tmp.length; t += 3) {
+    const a = tmp[t], b = tmp[t + 1], c = tmp[t + 2];
+    if (canon[a] === canon[b] || canon[b] === canon[c] || canon[a] === canon[c]) continue;
+    indices[ic++] = a;
+    indices[ic++] = b;
+    indices[ic++] = c;
+  }
+  return { positions, normals, uvs, attribs, canon, indices: indices.slice(0, ic) };
 }
 
 function splitIntoClusters(idx: Uint32Array, pos: Float32Array, localToGlobal: Uint32Array | null): Uint32Array[] {
@@ -267,7 +348,7 @@ interface GroupResult {
 function simplifyGroup(
   members: number[],
   clusters: BCluster[],
-  positions: Float32Array,
+  mesh: Welded,
   locked: Uint8Array,
   maxError: number,
   S: Scratch,
@@ -293,30 +374,29 @@ function simplifyGroup(
       localIdx[k++] = S.local[v];
     }
   }
+  const { positions, attribs, canon } = mesh;
   const lpos = new Float32Array(localCount * 3);
+  const lattr = new Float32Array(localCount * ATTRIBUTES);
   const lock = new Uint8Array(localCount);
   for (let l = 0; l < localCount; l++) {
     const g = S.l2g[l];
     lpos[l * 3] = positions[g * 3];
     lpos[l * 3 + 1] = positions[g * 3 + 1];
     lpos[l * 3 + 2] = positions[g * 3 + 2];
-    lock[l] = locked[g];
+    lattr.set(attribs.subarray(g * ATTRIBUTES, (g + 1) * ATTRIBUTES), l * ATTRIBUTES);
+    lock[l] = locked[canon[g]]; // every UV-seam copy of a border position is locked together
   }
 
   const triCount = indexCount / 3;
   const target = Math.max(1, Math.floor(triCount / 2)) * 3;
-  const [simplified, error] = MeshoptSimplifier.simplifyWithAttributes(
-    localIdx,
-    lpos,
-    3,
-    EMPTY_ATTRIBS,
-    0,
-    [],
-    lock,
-    target,
-    maxError,
-    ['ErrorAbsolute'],
-  );
+  const simplify = (weights: number[], flags: ('ErrorAbsolute' | 'Permissive')[]) =>
+    MeshoptSimplifier.simplifyWithAttributes(localIdx, lpos, 3, lattr, ATTRIBUTES, weights, lock, target, maxError, flags);
+  let [simplified, error] = simplify(ATTRIBUTE_WEIGHTS, ['ErrorAbsolute']);
+  if (simplified.length > indexCount * MIN_REDUCTION) {
+    // Stuck on UV seams: without this the DAG stops converging and far-away models keep thousands
+    // of triangles. Let the simplifier cut across seams, paying for it in error.
+    [simplified, error] = simplify(PERMISSIVE_WEIGHTS, ['ErrorAbsolute', 'Permissive']);
+  }
   if (simplified.length === 0 || simplified.length > indexCount * MIN_REDUCTION) return null;
 
   const l2g = S.l2g.slice(0, localCount);
@@ -327,14 +407,14 @@ function simplifyGroup(
  * Partition clusters into groups of ~GROUP_SIZE that share as many vertices as possible.
  * Greedy region growing seeded in Morton order, with a spatial fallback for disconnected pieces
  * and a final pass that folds tiny leftover groups into a neighbour. Also fills `S.locked` with
- * the vertices that are shared between different groups.
+ * the positions (canonical vertex ids) that are shared between different groups.
  */
-function partition(ids: number[], clusters: BCluster[], S: Scratch): number[][] {
+function partition(ids: number[], clusters: BCluster[], canon: Uint32Array, S: Scratch): number[][] {
   const n = ids.length;
   S.locked.fill(0);
   if (n <= GROUP_SIZE) return [ids.slice()];
 
-  // Unique vertex list for each cluster.
+  // Unique position list for each cluster.
   const cvStart = new Uint32Array(n + 1);
   let upper = 0;
   for (let i = 0; i < n; i++) upper += clusters[ids[i]].tris.length;
@@ -345,7 +425,7 @@ function partition(ids: number[], clusters: BCluster[], S: Scratch): number[][] 
     const stamp = S.next();
     const tris = clusters[ids[i]].tris;
     for (let k = 0; k < tris.length; k++) {
-      const v = tris[k];
+      const v = canon[tris[k]];
       if (S.stamp[v] !== stamp) {
         S.stamp[v] = stamp;
         cv[p++] = v;
@@ -504,7 +584,7 @@ function partition(ids: number[], clusters: BCluster[], S: Scratch): number[][] 
     alive[g] = 0;
   }
 
-  // Vertices touched by clusters of more than one group are locked during simplification.
+  // Positions touched by clusters of more than one group are locked during simplification.
   for (let i = 0; i < n; i++) {
     const g = groupOf[i];
     for (let k = cvStart[i]; k < cvStart[i + 1]; k++) {
@@ -587,7 +667,7 @@ function mergeSpheres(list: Sphere[]): Sphere {
 
 function pack(
   clusters: BCluster[],
-  positions: Float32Array,
+  mesh: Welded,
   sourceTriangles: number,
   sourceVertices: number,
   center: [number, number, number],
@@ -626,7 +706,9 @@ function pack(
     levels[c.level].triangles += tc;
   });
   return {
-    positions,
+    positions: mesh.positions,
+    normals: mesh.normals,
+    uvs: mesh.uvs,
     indices,
     clusters: buf,
     clusterCount: clusters.length,

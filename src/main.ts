@@ -1,9 +1,8 @@
 import { Renderer, type GpuStats } from './renderer';
 import { OrbitCamera } from './camera';
 import { lookAt, multiply, perspectiveReversedInfinite } from './math';
-import { loadGltf } from './loader';
-import type { BuildResult } from './builder';
-import type { WorkerRequest } from './builder.worker';
+import { loadGltf, type MaterialInfo } from './loader';
+import type { BuildResult, MeshInput } from './builder';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -22,6 +21,7 @@ let renderer: Renderer;
 let camera: OrbitCamera;
 let model: BuildResult | null = null;
 let modelName = '';
+let materialSummary = { maps: '', sizes: '', bytes: 0, textured: false };
 
 main();
 
@@ -89,7 +89,7 @@ let jobId = 0;
 let worker: Worker | null = null;
 let cancelBuild: (() => void) | null = null;
 
-function build(req: WorkerRequest, transfer: Transferable[]): Promise<BuildResult> {
+function build(req: MeshInput, transfer: Transferable[]): Promise<BuildResult> {
   cancelBuild?.();
   worker?.terminate();
   const w = (worker = new Worker(new URL('./builder.worker.ts', import.meta.url), { type: 'module' }));
@@ -118,10 +118,15 @@ async function loadModel(src: Source) {
     await new Promise((r) => setTimeout(r, 30)); // let the overlay paint
     const mesh = await loadGltf(buf);
     if (my !== jobId) return;
-    const req: WorkerRequest = { positions: mesh.positions, indices: mesh.indices };
-    const result = await build(req, [mesh.positions.buffer, mesh.indices.buffer]);
+    // Textures decode on the main thread while the worker builds the DAG.
+    const { positions, normals, uvs, indices } = mesh;
+    const result = await build({ positions, normals, uvs, indices }, [positions.buffer, normals.buffer, uvs.buffer, indices.buffer]);
     if (my !== jobId) return;
-    renderer.setScene(result);
+    setProgress('Decoding textures', 1);
+    const material = await mesh.material;
+    if (my !== jobId) return;
+    materialSummary = summarizeMaterial(material, mesh.materialCount);
+    renderer.setScene(result, material);
     model = result;
     modelName = label;
     onModelLoaded();
@@ -176,22 +181,47 @@ async function listProjectModels(): Promise<string[]> {
   }
 }
 
+/** One line for the model panel, plus texture memory (with mips) for the GPU total. */
+function summarizeMaterial(mat: MaterialInfo | null, count: number) {
+  if (!mat) return { maps: `${count} materials (unsupported)`, sizes: '', bytes: 0, textured: false };
+  const slots: [string, ImageBitmap | null][] = [
+    ['colour', mat.baseColor],
+    ['normal', mat.normal],
+    ['rough', mat.metallicRoughness],
+  ];
+  const present = slots.filter(([, b]) => b);
+  const bytes = present.reduce((sum, [, b]) => sum + (b!.width * b!.height * 4 * 4) / 3, 0);
+  const size = (w: number) => (w >= 1024 ? `${+(w / 1024).toFixed(1)}K` : `${w}px`);
+  const sizes = [...new Set(present.map(([, b]) => size(b!.width)))].join('/');
+  const maps = present.length ? present.map(([n]) => n).join(', ') : 'none';
+  return { maps, sizes, bytes, textured: true };
+}
+
 function onModelLoaded() {
   const m = model!;
   let dagTris = 0;
   for (const l of m.levels) dagTris += l.triangles;
-  const gpuMB = (m.indices.byteLength + m.positions.byteLength + m.clusters.byteLength) / 2 ** 20;
-  $('model-info').innerHTML = [
+  const geometryBytes = m.indices.byteLength + m.positions.byteLength + m.normals.byteLength + m.uvs.byteLength + m.clusters.byteLength;
+  const mb = (bytes: number) => `${(bytes / 2 ** 20).toFixed(0)} MB`;
+  const rows = [
     ['Model', modelName],
     ['Source triangles', fmt(m.sourceTriangles)],
     ['Welded vertices', fmt(m.positions.length / 3)],
     ['DAG', `${fmt(m.clusterCount)} clusters · ${m.levels.length} levels`],
     ['DAG triangles', `${fmt(dagTris)} (${(dagTris / m.sourceTriangles).toFixed(2)}×)`],
-    ['GPU data', `${gpuMB.toFixed(1)} MB`],
-    ['Build time', `${(m.buildMs / 1000).toFixed(2)} s`],
-  ]
+    ['Mesh memory', mb(geometryBytes)],
+    ['Textures', materialSummary.maps],
+  ];
+  if (materialSummary.bytes) rows.push(['Texture memory', `${mb(materialSummary.bytes)} · ${materialSummary.sizes}`]);
+  rows.push(['Build time', `${(m.buildMs / 1000).toFixed(2)} s`]);
+  $('model-info').innerHTML = rows
     .map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(v)}</dd>`)
     .join('');
+
+  const texButton = $('view-mode').querySelector<HTMLButtonElement>('[data-v="3"]')!;
+  texButton.disabled = !materialSummary.textured;
+  texButton.title = materialSummary.textured ? '' : 'Texturing supports models with a single material';
+  if (texButton.disabled && state.viewMode === 3) $('view-mode').querySelector<HTMLButtonElement>('button')!.click();
 
   const bars = $('levels');
   bars.innerHTML = '';
@@ -264,7 +294,7 @@ function bindUi() {
     if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.code === 'KeyR') reframe();
-    else if (/^Digit[1-3]$/.test(e.code)) modes[Number(e.code.slice(5)) - 1].click();
+    else if (/^Digit[1-4]$/.test(e.code)) modes[Number(e.code.slice(5)) - 1].click();
   });
 
   // Drag & drop
