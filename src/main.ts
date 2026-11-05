@@ -291,7 +291,7 @@ function bindUi() {
     nanite.classList.toggle('on', state.nanite);
     nanite.setAttribute('aria-pressed', String(state.nanite));
     nanite.textContent = state.nanite ? 'Nanite enabled' : 'Nanite disabled';
-    $('quality-field').hidden = !state.nanite;
+    $('quality').hidden = !state.nanite;
   };
 
   const grid = $<HTMLInputElement>('grid');
