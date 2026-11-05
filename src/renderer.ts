@@ -10,7 +10,8 @@ export interface FrameParams {
   camPos: Vec3;
   fovY: number;
   nanite: boolean; // false: draw the original mesh, no LOD
-  budget: number; // target triangles drawn per frame while Nanite is on
+  threshold: number; // max projected error in CSS pixels while Nanite is on
+  budget: number; // triangle cap while Nanite is on, 0 = none
   viewMode: number;
   gridSize: number;
   spacing: number;
@@ -21,12 +22,13 @@ export interface GpuStats {
   triangles: number;
   overflow: number;
   levels: Uint32Array;
-  threshold: number; // pixel error the budget resolved to (3e38 when only the DAG roots fit)
+  threshold: number; // pixel error actually used (3e38 when even the DAG roots exceed the cap)
+  capped: boolean; // the triangle cap raised it above the quality setting
   gpuCullMs: number | null; // null when timestamp queries aren't supported
   gpuDrawMs: number | null;
 }
 
-const UNIFORM_SIZE = 240;
+const UNIFORM_SIZE = 256;
 const STATS_SIZE = 16 + 32 * 4;
 const SAMPLES = 4;
 const READBACK_SIZE = 16 + STATS_SIZE + 32; // draw args + stats + 4 timestamps
@@ -343,7 +345,7 @@ export class Renderer {
     f.set([...p.camPos, 1], 40);
     // LOD error is measured in CSS pixels, so quality presets look the same at any devicePixelRatio.
     f[44] = Math.max(1, this.canvas.clientHeight) / (2 * Math.tan(p.fovY / 2));
-    u[45] = Math.max(0, Math.min(0xffffffff, Math.round(p.budget)));
+    f[45] = p.threshold;
     f[46] = s?.minDist ?? 1e-6;
     f[47] = p.spacing;
     u[48] = s?.numClusters ?? 0;
@@ -356,6 +358,7 @@ export class Renderer {
     f[57] = m?.roughness ?? 1;
     f[58] = m?.normalScale ?? 1;
     u[59] = p.nanite ? 0 : 1; // fullDetail: LOD selection off
+    u[60] = Math.max(0, Math.min(0xffffffff, Math.round(p.budget)));
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
     d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));
@@ -370,9 +373,11 @@ export class Renderer {
       const groups = [Math.ceil(s.numClusters / 64), p.gridSize * p.gridSize] as const;
       cp.setBindGroup(0, s.cullBindGroup);
       if (p.nanite) {
-        // Turn the triangle budget into a pixel-error threshold for this exact view, then cull.
-        cp.setPipeline(this.histogramPipeline);
-        cp.dispatchWorkgroups(Math.ceil(s.numClusters / HIST_GROUP), groups[1]);
+        // Settle this frame's threshold: the quality setting, raised if needed to fit the cap.
+        if (p.budget > 0) {
+          cp.setPipeline(this.histogramPipeline);
+          cp.dispatchWorkgroups(Math.ceil(s.numClusters / HIST_GROUP), groups[1]);
+        }
         cp.setPipeline(this.pickPipeline);
         cp.dispatchWorkgroups(1);
       }
@@ -432,6 +437,7 @@ export class Renderer {
             overflow: data[5],
             levels: data.slice(8, 40),
             threshold: new Float32Array(bytes, 16 + 8, 1)[0],
+            capped: data[7] === 1,
             gpuCullMs: ts ? ms(t[0], t[1]) : null,
             gpuDrawMs: ts ? ms(t[2], t[3]) : null,
           });

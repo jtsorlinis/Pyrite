@@ -1,8 +1,9 @@
 // WGSL for the passes:
 //   cull: three compute entry points, run in order each frame:
-//         histogram - for every visible (cluster, instance), how many triangles it adds to the cut
-//                     at each pixel-error threshold (a histogram over log2(threshold))
-//         pick      - prefix-sums the histogram and picks the finest threshold within the budget
+//         histogram - only with a triangle cap: for every visible (cluster, instance), how many
+//                     triangles it adds to the cut at each pixel-error threshold (a histogram over
+//                     log2(threshold))
+//         pick      - the pixel-error setting, raised just enough to fit the cap if there is one
 //         main      - the parallel DAG-cut LOD test with that threshold, plus frustum culling;
 //                     appends survivors to a visible list + indirect draw args
 //   draw: vertex pulling. One instance per visible cluster, 128*3 vertices per instance;
@@ -15,7 +16,7 @@ struct Uniforms {
   planes: array<vec4f, 6>,
   camPos: vec4f,
   lodScale: f32,      // viewport height in CSS pixels / (2 * tan(fovY / 2))
-  budget: u32,        // triangle budget; the pick pass turns it into a pixel-error threshold
+  threshold: f32,     // max projected error, CSS pixels (the quality setting)
   minDist: f32,
   spacing: f32,       // instance grid spacing
   numClusters: u32,
@@ -27,6 +28,10 @@ struct Uniforms {
   roughnessFactor: f32,
   normalScale: f32,
   fullDetail: u32,    // 1 = Nanite off: draw the original mesh (every level-0 cluster)
+  budget: u32,        // triangle cap, 0 = none; pick raises the threshold until the cut fits
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
 };
 
 struct Cluster {
@@ -69,7 +74,7 @@ struct Stats {
   tris: atomic<u32>,
   overflow: atomic<u32>,
   threshold: f32,     // chosen by the pick pass, for the UI
-  predicted: u32,     // triangles the histogram predicted at that threshold
+  capped: u32,        // 1 if the triangle cap had to raise the threshold
   levels: array<atomic<u32>, 32>,
 };
 
@@ -172,24 +177,33 @@ fn histogram(@builtin(global_invocation_id) gid: vec3u) {
   }
 }
 
-// Pass 2. Triangles in the cut only go down as the threshold rises, so walk up from the finest
-// threshold and stop at the first one that fits. 512 steps on one thread: a few microseconds.
+// Pass 2. Start from the pixel-error setting. With a cap, also find the finest threshold whose cut
+// fits it (triangles in the cut only go down as the threshold rises, so walk up from the finest and
+// stop at the first that fits: 512 steps on one thread, a few microseconds) and use whichever of
+// the two is coarser. The quality presets sit exactly on bins, so a setting that already fits is
+// never raised.
 @compute @workgroup_size(1)
 fn pick() {
-  var total = 0u;
-  var chosen = NOTHING_FITS;
-  var predicted = 0u;
-  for (var k = 0u; k < BINS; k++) {
-    total += atomicLoad(&hist[k]);
-    if (total <= u.budget) {
-      chosen = thresholdOf(k);
-      predicted = total;
-      break;
+  var chosen = u.threshold;
+  var capped = 0u;
+  if (u.budget > 0u) {
+    var total = 0u;
+    var fits = NOTHING_FITS;
+    for (var k = 0u; k < BINS; k++) {
+      total += atomicLoad(&hist[k]);
+      if (total <= u.budget) {
+        fits = thresholdOf(k);
+        break;
+      }
+    }
+    if (fits > chosen) {
+      chosen = fits;
+      capped = 1u;
     }
   }
   lod.threshold = chosen;
   stats.threshold = chosen;
-  stats.predicted = predicted;
+  stats.capped = capped;
 }
 
 // Pass 3: select and append.
