@@ -12,7 +12,8 @@ Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on s
 ## Things to try
 
 - **Texture / Triangle** view (keys 1–2). Texture uses the model's base colour, normal and metallic-roughness maps; Triangle gives each triangle its own colour.
-- **Quality** Low / Medium / High: allows 4 / 2 / 1 px of error. Drop it and whole regions collapse to coarser DAG levels. **Full (Nanite disabled)** draws the original mesh everywhere (frustum culling still applies), for comparison.
+- **Nanite enabled / disabled**: turn it off to draw the original mesh everywhere (frustum culling still applies), for comparison.
+- **Quality** Low / Medium / High (while Nanite is on): allows 4 / 2 / 1 px of error. Drop it and whole regions collapse to coarser DAG levels.
 - **Instances**: up to 576 copies, laid out on a square grid. 144 dragons is 453M source triangles, of which about 1% get drawn.
 
 ## How it works

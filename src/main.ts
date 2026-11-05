@@ -12,7 +12,8 @@ const DEFAULT_MODEL = 'dragon.glb';
 
 const state = {
   viewMode: 0,
-  threshold: 1,
+  nanite: true, // off = draw the original mesh with no LOD
+  threshold: 1, // max projected error in pixels, used while Nanite is on
   grid: 1,
 };
 
@@ -64,7 +65,7 @@ function frame(t: number) {
     viewProj: multiply(proj, lookAt(eye, camera.target, [0, 1, 0])),
     camPos: eye,
     fovY: camera.fovY,
-    threshold: state.threshold,
+    threshold: state.nanite ? state.threshold : 0, // 0 tells the renderer to skip LOD
     viewMode: state.viewMode,
     gridSize: state.grid,
     spacing: spacing(),
@@ -267,7 +268,8 @@ function onStats(s: GpuStats) {
   }
   const of = $('overflow');
   of.hidden = !s.overflow;
-  if (s.overflow) of.textContent = `Visible list full: ${fmt(s.overflow)} clusters dropped. Lower the quality.`;
+  const fix = state.nanite ? 'Lower the quality.' : 'Enable Nanite or use fewer instances.';
+  if (s.overflow) of.textContent = `Visible list full: ${fmt(s.overflow)} clusters dropped. ${fix}`;
 }
 
 // --- UI ----------------------------------------------------------------------------------------
@@ -282,7 +284,15 @@ function bindUi() {
   };
 
   const modes = segmented('view-mode', (v) => (state.viewMode = v));
-  segmented('quality', (v) => (state.threshold = v)); // max projected error in pixels; 0 = Full (no LOD)
+  segmented('quality', (v) => (state.threshold = v));
+  const nanite = $<HTMLButtonElement>('nanite');
+  nanite.onclick = () => {
+    state.nanite = !state.nanite;
+    nanite.classList.toggle('on', state.nanite);
+    nanite.setAttribute('aria-pressed', String(state.nanite));
+    nanite.textContent = state.nanite ? 'Nanite enabled' : 'Nanite disabled';
+    $('quality-field').hidden = !state.nanite;
+  };
 
   const grid = $<HTMLInputElement>('grid');
   grid.oninput = () => {
