@@ -9,7 +9,9 @@ export interface FrameParams {
   viewProj: Mat4;
   camPos: Vec3;
   fovY: number;
-  threshold: number;
+  nanite: boolean; // false: draw the original mesh, no LOD
+  threshold: number; // max projected error in rendered pixels while Nanite is on
+  budget: number; // triangle cap while Nanite is on, 0 = none
   viewMode: number;
   gridSize: number;
   spacing: number;
@@ -20,14 +22,18 @@ export interface GpuStats {
   triangles: number;
   overflow: number;
   levels: Uint32Array;
+  threshold: number; // pixel error actually used (3e38 when even the DAG roots exceed the cap)
+  capped: boolean; // the triangle cap raised it above the quality setting
   gpuCullMs: number | null; // null when timestamp queries aren't supported
   gpuDrawMs: number | null;
 }
 
-const UNIFORM_SIZE = 240;
+const UNIFORM_SIZE = 256;
 const STATS_SIZE = 16 + 32 * 4;
 const SAMPLES = 4;
 const READBACK_SIZE = 16 + STATS_SIZE + 32; // draw args + stats + 4 timestamps
+const HIST_BINS = 512; // must match BINS in the cull shader
+const HIST_GROUP = 256; // must match HIST_GROUP in the cull shader
 
 interface Scene {
   buffers: GPUBuffer[];
@@ -45,6 +51,10 @@ export class Renderer {
 
   private format: GPUTextureFormat;
   private cullPipeline: GPUComputePipeline;
+  private histogramPipeline: GPUComputePipeline;
+  private pickPipeline: GPUComputePipeline;
+  private histBuffer: GPUBuffer;
+  private lodBuffer: GPUBuffer;
   private drawPipeline: GPURenderPipeline;
   private cullLayout: GPUBindGroupLayout;
   private drawLayout: GPUBindGroupLayout;
@@ -102,6 +112,8 @@ export class Renderer {
         { binding: 2, visibility: C, buffer: { type: 'storage' } },
         { binding: 3, visibility: C, buffer: { type: 'storage' } },
         { binding: 4, visibility: C, buffer: { type: 'storage' } },
+        { binding: 5, visibility: C, buffer: { type: 'storage' } }, // threshold histogram
+        { binding: 6, visibility: C, buffer: { type: 'storage' } }, // chosen threshold
       ],
     });
     this.drawLayout = device.createBindGroupLayout({
@@ -129,10 +141,14 @@ export class Renderer {
       });
     }
 
-    this.cullPipeline = device.createComputePipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.cullLayout] }),
-      compute: { module: cullModule, entryPoint: 'main' },
-    });
+    const cullPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.cullLayout] });
+    const computePipeline = (entryPoint: string) =>
+      device.createComputePipeline({ layout: cullPipelineLayout, compute: { module: cullModule, entryPoint } });
+    this.histogramPipeline = computePipeline('histogram');
+    this.pickPipeline = computePipeline('pick');
+    this.cullPipeline = computePipeline('main');
+    this.histBuffer = device.createBuffer({ size: HIST_BINS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.lodBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
     this.drawPipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.drawLayout] }),
       vertex: { module: drawModule, entryPoint: 'vs' },
@@ -213,6 +229,8 @@ export class Renderer {
         { binding: 2, resource: { buffer: this.drawArgsBuffer } },
         { binding: 3, resource: { buffer: this.visibleBuffer } },
         { binding: 4, resource: { buffer: this.statsBuffer } },
+        { binding: 5, resource: { buffer: this.histBuffer } },
+        { binding: 6, resource: { buffer: this.lodBuffer } },
       ],
     });
     const drawBindGroup = d.createBindGroup({
@@ -340,7 +358,8 @@ export class Renderer {
     f[56] = m?.metallic ?? 0;
     f[57] = m?.roughness ?? 1;
     f[58] = m?.normalScale ?? 1;
-    u[59] = p.threshold <= 0 ? 1 : 0; // a threshold of 0 means Full: LOD selection off
+    u[59] = p.nanite ? 0 : 1; // fullDetail: LOD selection off
+    u[60] = Math.max(0, Math.min(0xffffffff, Math.round(p.budget)));
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
     d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));
@@ -348,12 +367,23 @@ export class Renderer {
     const enc = d.createCommandEncoder();
     const ts = s ? this.timing : null;
     if (s) {
+      enc.clearBuffer(this.histBuffer);
       const cp = enc.beginComputePass(
         ts ? { timestampWrites: { querySet: ts.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
       );
-      cp.setPipeline(this.cullPipeline);
+      const groups = [Math.ceil(s.numClusters / 64), p.gridSize * p.gridSize] as const;
       cp.setBindGroup(0, s.cullBindGroup);
-      cp.dispatchWorkgroups(Math.ceil(s.numClusters / 64), p.gridSize * p.gridSize);
+      if (p.nanite) {
+        // Settle this frame's threshold: the quality setting, raised if needed to fit the cap.
+        if (p.budget > 0) {
+          cp.setPipeline(this.histogramPipeline);
+          cp.dispatchWorkgroups(Math.ceil(s.numClusters / HIST_GROUP), groups[1]);
+        }
+        cp.setPipeline(this.pickPipeline);
+        cp.dispatchWorkgroups(1);
+      }
+      cp.setPipeline(this.cullPipeline);
+      cp.dispatchWorkgroups(...groups);
       cp.end();
     }
     const rp = enc.beginRenderPass({
@@ -407,6 +437,8 @@ export class Renderer {
             triangles: data[4],
             overflow: data[5],
             levels: data.slice(8, 40),
+            threshold: new Float32Array(bytes, 16 + 8, 1)[0],
+            capped: data[7] === 1,
             gpuCullMs: ts ? ms(t[0], t[1]) : null,
             gpuDrawMs: ts ? ms(t[2], t[3]) : null,
           });

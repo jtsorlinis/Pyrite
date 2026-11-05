@@ -13,7 +13,8 @@ const DEFAULT_MODEL = 'dragon.glb';
 const state = {
   viewMode: 0,
   nanite: true, // off = draw the original mesh with no LOD
-  threshold: 1, // max projected error in pixels, used while Nanite is on
+  threshold: 1, // max projected error in pixels while Nanite is on
+  budget: 1_000_000, // triangle cap (0 = none): the GPU raises the error just enough to fit
   grid: 1,
 };
 
@@ -65,7 +66,9 @@ function frame(t: number) {
     viewProj: multiply(proj, lookAt(eye, camera.target, [0, 1, 0])),
     camPos: eye,
     fovY: camera.fovY,
-    threshold: state.nanite ? state.threshold : 0, // 0 tells the renderer to skip LOD
+    nanite: state.nanite,
+    threshold: state.threshold,
+    budget: state.budget,
     viewMode: state.viewMode,
     gridSize: state.grid,
     spacing: spacing(),
@@ -246,6 +249,9 @@ function onStats(s: GpuStats) {
   const sceneTris = model.sourceTriangles * state.grid * state.grid;
   $('st-tris').textContent = fmt(s.triangles);
   $('st-clusters').textContent = fmt(Math.min(s.clusters, renderer.capacity));
+  const t = s.threshold;
+  const px = `${t < 1 ? t.toFixed(2) : t.toFixed(1)} px`;
+  $('st-err').textContent = !state.nanite ? 'none (full mesh)' : t > 1e30 ? 'coarsest (over cap)' : s.capped ? `${px} (capped)` : px;
   $('st-scene').textContent = compact(sceneTris);
   const ratio = s.triangles / sceneTris;
   $('st-ratio').textContent = s.triangles ? `${(ratio * 100).toFixed(ratio < 0.01 ? 3 : 1)}%  (1 : ${compact(Math.round(1 / ratio))})` : '–';
@@ -268,7 +274,7 @@ function onStats(s: GpuStats) {
   }
   const of = $('overflow');
   of.hidden = !s.overflow;
-  const fix = state.nanite ? 'Lower the quality.' : 'Enable Nanite or use fewer instances.';
+  const fix = state.nanite ? 'Lower the quality or set a triangle cap.' : 'Enable Nanite or use fewer instances.';
   if (s.overflow) of.textContent = `Visible list full: ${fmt(s.overflow)} clusters dropped. ${fix}`;
 }
 
@@ -285,13 +291,14 @@ function bindUi() {
 
   const modes = segmented('view-mode', (v) => (state.viewMode = v));
   segmented('quality', (v) => (state.threshold = v));
+  segmented('budget', (v) => (state.budget = v));
   const nanite = $<HTMLButtonElement>('nanite');
   nanite.onclick = () => {
     state.nanite = !state.nanite;
     nanite.classList.toggle('on', state.nanite);
     nanite.setAttribute('aria-pressed', String(state.nanite));
     nanite.textContent = state.nanite ? 'Nanite enabled' : 'Nanite disabled';
-    $('quality').hidden = !state.nanite;
+    $('lod-options').hidden = !state.nanite;
   };
 
   const grid = $<HTMLInputElement>('grid');

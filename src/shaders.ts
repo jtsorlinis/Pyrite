@@ -1,6 +1,11 @@
-// WGSL for the two passes:
-//   cull: one thread per (cluster, instance). Runs the parallel DAG-cut LOD test plus frustum
-//         culling, and appends survivors to a visible list + indirect draw args.
+// WGSL for the passes:
+//   cull: three compute entry points, run in order each frame:
+//         histogram - only with a triangle cap: for every visible (cluster, instance), how many
+//                     triangles it adds to the cut at each pixel-error threshold (a histogram over
+//                     log2(threshold))
+//         pick      - the pixel-error setting, raised just enough to fit the cap if there is one
+//         main      - the parallel DAG-cut LOD test with that threshold, plus frustum culling;
+//                     appends survivors to a visible list + indirect draw args
 //   draw: vertex pulling. One instance per visible cluster, 128*3 vertices per instance;
 //         triangles past the cluster's count collapse to nothing.
 //   mip:  fullscreen blit used to build texture mip chains (WebGPU has no generateMipmap).
@@ -11,7 +16,7 @@ struct Uniforms {
   planes: array<vec4f, 6>,
   camPos: vec4f,
   lodScale: f32,      // render-target height in pixels / (2 * tan(fovY / 2))
-  threshold: f32,     // max allowed projected error, rendered pixels
+  threshold: f32,     // max projected error, rendered pixels (the quality setting)
   minDist: f32,
   spacing: f32,       // instance grid spacing
   numClusters: u32,
@@ -23,6 +28,10 @@ struct Uniforms {
   roughnessFactor: f32,
   normalScale: f32,
   fullDetail: u32,    // 1 = Nanite off: draw the original mesh (every level-0 cluster)
+  budget: u32,        // triangle cap, 0 = none; pick raises the threshold until the cut fits
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
 };
 
 struct Cluster {
@@ -64,14 +73,42 @@ struct DrawArgs {
 struct Stats {
   tris: atomic<u32>,
   overflow: atomic<u32>,
-  pad0: u32,
-  pad1: u32,
+  threshold: f32,     // chosen by the pick pass, for the UI
+  capped: u32,        // 1 if the triangle cap had to raise the threshold
   levels: array<atomic<u32>, 32>,
+};
+
+struct LodState {
+  threshold: f32,     // max projected error in rendered pixels, written by pick, read by main
 };
 
 @group(0) @binding(2) var<storage, read_write> drawArgs: DrawArgs;
 @group(0) @binding(3) var<storage, read_write> visible: array<vec2u>;
 @group(0) @binding(4) var<storage, read_write> stats: Stats;
+// hist[k] = change in drawn triangles when the threshold steps up to thresholdOf(k): + for clusters
+// whose own error is reached there, - for clusters whose parent's error is reached (they hand over
+// to the parent). Wrapping u32 maths: running totals are exact as long as the true count fits.
+@group(0) @binding(5) var<storage, read_write> hist: array<atomic<u32>, BINS>;
+@group(0) @binding(6) var<storage, read_write> lod: LodState;
+
+// Thresholds from 1/64 px to 1024 px in steps of 2^(1/32) (about 2%).
+const BINS = 512u;
+const BINS_PER_OCTAVE = 32.0;
+const LOG2_MIN = -6.0;
+const NOTHING_FITS = 3.0e38; // even the coarsest cut is over budget: draw the DAG roots
+const HIST_GROUP = 256u;     // histogram workgroup size: must match the dispatch in renderer.ts
+
+fn thresholdOf(k: u32) -> f32 {
+  return exp2(LOG2_MIN + f32(k) / BINS_PER_OCTAVE);
+}
+
+// Smallest bin whose threshold is >= e (BINS if e is beyond the range).
+fn binOf(e: f32) -> u32 {
+  let k = ceil((log2(max(e, 1e-30)) - LOG2_MIN) * BINS_PER_OCTAVE);
+  return u32(clamp(k, 0.0, f32(BINS)));
+}
+
+var<workgroup> localHist: array<atomic<u32>, BINS>;
 
 var<workgroup> wgCount: atomic<u32>;
 var<workgroup> wgBase: u32;
@@ -93,10 +130,88 @@ fn inFrustum(s: vec4f, off: vec3f) -> bool {
   return true;
 }
 
+// Pass 1. Cluster c is in the cut for thresholds t with own <= t < parent, so it adds triCount at
+// bin(own) and removes it again at bin(parent). Bins are summed in workgroup memory first: every
+// level-0 cluster lands in bin 0, and one global atomic per thread there would serialize badly.
+// (Workgroup memory starts zeroed, as WGSL guarantees.)
+@compute @workgroup_size(HIST_GROUP)
+fn histogram(@builtin(global_invocation_id) gid: vec3u) {
+  let ci = gid.x;
+  var a = BINS;
+  var b = BINS;
+  if (ci < u.numClusters) {
+    let c = clusters[ci];
+    let off = instanceOffset(gid.y);
+    if (inFrustum(c.bounds, off)) {
+      a = binOf(projectedError(c.lodBounds, c.lodError, off));
+      if (c.parentLevel != ROOT) {
+        b = binOf(projectedError(c.parentBounds, c.parentError, off));
+      }
+      // Own and parent error in the same bin: the cluster is never in the cut at any threshold we
+      // can pick, so it adds nothing. That's most fine clusters of distant instances.
+      if (a < b) {
+        atomicAdd(&localHist[a], c.triCount);
+        if (b < BINS) {
+          atomicSub(&localHist[b], c.triCount);
+        }
+      } else {
+        a = BINS;
+        b = BINS;
+      }
+    }
+  }
+  workgroupBarrier();
+  // Flush only the bins this workgroup touched: whichever thread swaps a bin out first carries
+  // its total to the global histogram, the rest find zero.
+  if (a < BINS) {
+    let n = atomicExchange(&localHist[a], 0u);
+    if (n != 0u) {
+      atomicAdd(&hist[a], n);
+    }
+  }
+  if (b < BINS) {
+    let n = atomicExchange(&localHist[b], 0u);
+    if (n != 0u) {
+      atomicAdd(&hist[b], n);
+    }
+  }
+}
+
+// Pass 2. Start from the pixel-error setting. With a cap, also find the finest threshold whose cut
+// fits it (triangles in the cut only go down as the threshold rises, so walk up from the finest and
+// stop at the first that fits: 512 steps on one thread, a few microseconds) and use whichever of
+// the two is coarser. The quality presets sit exactly on bins, so a setting that already fits is
+// never raised.
+@compute @workgroup_size(1)
+fn pick() {
+  var chosen = u.threshold;
+  var capped = 0u;
+  if (u.budget > 0u) {
+    var total = 0u;
+    var fits = NOTHING_FITS;
+    for (var k = 0u; k < BINS; k++) {
+      total += atomicLoad(&hist[k]);
+      if (total <= u.budget) {
+        fits = thresholdOf(k);
+        break;
+      }
+    }
+    if (fits > chosen) {
+      chosen = fits;
+      capped = 1u;
+    }
+  }
+  lod.threshold = chosen;
+  stats.threshold = chosen;
+  stats.capped = capped;
+}
+
+// Pass 3: select and append.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) lid: u32) {
   let ci = gid.x;
   let inst = gid.y;
+  let threshold = lod.threshold;
 
   var draw = false;
   var triCount = 0u;
@@ -111,8 +226,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
     if (u.fullDetail != 0u) {
       selected = c.level == 0u;
     } else {
-      let ownOk = projectedError(c.lodBounds, c.lodError, off) <= u.threshold;
-      let parentTooCoarse = c.parentLevel == ROOT || projectedError(c.parentBounds, c.parentError, off) > u.threshold;
+      let ownOk = projectedError(c.lodBounds, c.lodError, off) <= threshold;
+      let parentTooCoarse = c.parentLevel == ROOT || projectedError(c.parentBounds, c.parentError, off) > threshold;
       selected = ownOk && parentTooCoarse;
     }
     draw = selected && inFrustum(c.bounds, off);

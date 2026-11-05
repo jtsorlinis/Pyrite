@@ -210,10 +210,14 @@ button:disabled {
   display: block;
   margin-top: 9px;
 }
-.field > span {
+.field > span,
+.field .sub-label {
   display: block;
   margin-bottom: 4px;
   color: var(--muted);
+}
+.field .sub-label {
+  margin-top: 8px;
 }
 .slider span {
   display: flex;

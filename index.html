@@ -29,6 +29,7 @@
         <div class="hero"><span id="st-tris">–</span><small>triangles drawn</small></div>
         <dl class="kv">
           <dt>Clusters drawn</dt><dd id="st-clusters">–</dd>
+          <dt>Pixel error</dt><dd id="st-err">–</dd>
           <dt>Scene triangles</dt><dd id="st-scene">–</dd>
           <dt>Drawn / scene</dt><dd id="st-ratio">–</dd>
           <dt>Frame</dt><dd id="st-fps">–</dd>
@@ -48,10 +49,20 @@
         <div class="field">
           <span>Quality (max pixel error)</span>
           <button id="nanite" class="toggle on" aria-pressed="true">Nanite enabled</button>
-          <div class="seg" id="quality">
-            <button data-v="4">Low (4px)</button>
-            <button data-v="2">Medium (2px)</button>
-            <button data-v="1" class="on">High (1px)</button>
+          <div id="lod-options">
+            <div class="seg" id="quality">
+              <button data-v="4">Low (4px)</button>
+              <button data-v="2">Medium (2px)</button>
+              <button data-v="1" class="on">High (1px)</button>
+            </div>
+            <span class="sub-label">Triangle cap</span>
+            <div class="seg" id="budget">
+              <button data-v="0">Off</button>
+              <button data-v="250000">250K</button>
+              <button data-v="500000">500K</button>
+              <button data-v="1000000" class="on">1M</button>
+              <button data-v="2000000">2M</button>
+            </div>
           </div>
         </div>
         <label class="slider">
