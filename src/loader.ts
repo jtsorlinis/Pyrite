@@ -135,6 +135,7 @@ export async function loadGltf(data: ArrayBuffer): Promise<RawMesh> {
   }
 
   const only = materials.size === 1 ? [...materials][0] : null;
+  if (only !== null && only >= 0) applyUvTransform(uvs, file.json.materials?.[only]);
   return {
     positions,
     normals,
@@ -143,6 +144,37 @@ export async function loadGltf(data: ArrayBuffer): Promise<RawMesh> {
     materialCount: materials.size,
     material: only === null ? null : loadMaterial(file, only),
   };
+}
+
+/**
+ * KHR_texture_transform, baked into the UVs because one UV set serves every map. Quantizers such as
+ * gltfpack rely on it to map 16-bit UVs back to their real range, so ignoring it shifts the texture.
+ */
+function applyUvTransform(uvs: Float32Array, material: any) {
+  const pbr = material?.pbrMetallicRoughness ?? {};
+  const slots = [pbr.baseColorTexture, material?.normalTexture, pbr.metallicRoughnessTexture].filter(Boolean);
+  if (!slots.length) return;
+  const transforms = slots.map((s: any) => s.extensions?.KHR_texture_transform ?? null);
+  const t = transforms[0];
+  if (transforms.some((x: unknown) => JSON.stringify(x) !== JSON.stringify(t))) {
+    console.warn('Texture maps use different KHR_texture_transform values; using the first one for all');
+  }
+  if (!t) return;
+  if ((t.texCoord ?? 0) !== 0) {
+    console.warn('KHR_texture_transform targets a UV set other than TEXCOORD_0; ignoring it');
+    return;
+  }
+  const [ox, oy] = t.offset ?? [0, 0];
+  const [sx, sy] = t.scale ?? [1, 1];
+  const c = Math.cos(t.rotation ?? 0);
+  const s = Math.sin(t.rotation ?? 0);
+  // The spec's translation * rotation * scale, with rotation = mat3(c, s, 0, -s, c, 0, 0, 0, 1).
+  for (let i = 0; i < uvs.length; i += 2) {
+    const u = uvs[i] * sx;
+    const v = uvs[i + 1] * sy;
+    uvs[i] = c * u - s * v + ox;
+    uvs[i + 1] = s * u + c * v + oy;
+  }
 }
 
 // --- material -------------------------------------------------------------------------------------
