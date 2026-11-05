@@ -15,8 +15,8 @@ struct Uniforms {
   viewProj: mat4x4f,
   planes: array<vec4f, 6>,
   camPos: vec4f,
-  lodScale: f32,      // viewport height in CSS pixels / (2 * tan(fovY / 2))
-  threshold: f32,     // max projected error, CSS pixels (the quality setting)
+  lodScale: f32,      // render-target height in pixels / (2 * tan(fovY / 2))
+  threshold: f32,     // max projected error, rendered pixels (the quality setting)
   minDist: f32,
   spacing: f32,       // instance grid spacing
   numClusters: u32,
@@ -79,7 +79,7 @@ struct Stats {
 };
 
 struct LodState {
-  threshold: f32,     // max projected error in CSS pixels, written by pick, read by main
+  threshold: f32,     // max projected error in rendered pixels, written by pick, read by main
 };
 
 @group(0) @binding(2) var<storage, read_write> drawArgs: DrawArgs;

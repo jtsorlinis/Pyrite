@@ -10,7 +10,7 @@ export interface FrameParams {
   camPos: Vec3;
   fovY: number;
   nanite: boolean; // false: draw the original mesh, no LOD
-  threshold: number; // max projected error in CSS pixels while Nanite is on
+  threshold: number; // max projected error in rendered pixels while Nanite is on
   budget: number; // triangle cap while Nanite is on, 0 = none
   viewMode: number;
   gridSize: number;
@@ -343,8 +343,9 @@ export class Renderer {
     f.set(p.viewProj, 0);
     f.set(frustumPlanes(p.viewProj), 16);
     f.set([...p.camPos, 1], 40);
-    // LOD error is measured in CSS pixels, so quality presets look the same at any devicePixelRatio.
-    f[44] = Math.max(1, this.canvas.clientHeight) / (2 * Math.tan(p.fovY / 2));
+    // LOD error is measured in rendered pixels (the canvas's backing size, after devicePixelRatio),
+    // so "1px" means one pixel of the image actually drawn.
+    f[44] = Math.max(1, this.canvas.height) / (2 * Math.tan(p.fovY / 2));
     f[45] = p.threshold;
     f[46] = s?.minDist ?? 1e-6;
     f[47] = p.spacing;
