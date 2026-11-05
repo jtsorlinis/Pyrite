@@ -108,7 +108,7 @@ function build(req: MeshInput, transfer: Transferable[]): Promise<BuildResult> {
 
 async function loadModel(src: Source) {
   const my = ++jobId;
-  const label = src.kind === 'file' ? src.file.name : src.url.split('/').pop()!;
+  const label = displayName(src.kind === 'file' ? src.file.name : src.url);
   showOverlay(`Loading ${label}`);
   try {
     setProgress('Reading file', 0);
@@ -170,7 +170,7 @@ async function listProjectModels(): Promise<string[]> {
     for (const f of files) {
       const b = document.createElement('button');
       b.className = 'file';
-      b.textContent = f.split('/').pop()!;
+      b.textContent = displayName(f);
       b.title = `Load ${f} from the project folder`;
       b.onclick = () => loadModel({ kind: 'url', url: '/' + f });
       box.insertBefore(b, $('btn-open'));
@@ -355,6 +355,10 @@ function showError(title: string, detail: string) {
 
 // --- formatting --------------------------------------------------------------------------------
 
+/** "models/dragon.glb" -> "dragon" */
+function displayName(path: string) {
+  return path.split('/').pop()!.replace(/\.(glb|gltf)$/i, '');
+}
 function fmt(n: number) {
   return Math.round(n).toLocaleString('en-US');
 }
