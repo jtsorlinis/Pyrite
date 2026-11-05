@@ -9,7 +9,17 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-Needs a WebGPU browser (recent Chrome, Edge, or Safari). `dragon.glb` loads on startup. Any other `.glb` in the project folder (or `models/`) also gets a button, and you can drag and drop a file, use **Open .glb…**, or pass `?model=/path.glb`.
+Needs a WebGPU browser (recent Chrome, Edge, or Safari). `public/models/dragon.glb` loads on startup. Any other `.glb` in `public/models/` also gets a button, and you can drag and drop a file, use **Open .glb…**, or pass `?model=path.glb`.
+
+`npm run build` writes a static site to `dist/` that works from any path, GitHub Pages included: the models are copied in, and the list of them goes into `models.json`.
+
+The bundled models are packed for the web with `npm run pack-model -- in.glb public/models/out.glb` (needs `cwebp`: `brew install webp`), which takes the dragon from 150 MB to 32 MB and the warrior from 92 MB to 24 MB:
+
+- **Tangents dropped**: the renderer never reads them.
+- **Textures as WebP**: q92 for colour and roughness, q97 for normal maps. Against the original JPEGs that's about 41 dB PSNR for colour, and normals within 0.8° on average (2.2° at the 99th percentile).
+- **Geometry quantized and meshopt-compressed** (gltfpack, 16-bit positions and UVs, 12-bit normals): positions move at most 1.4% of a median triangle edge, UVs at most 0.03 texels at 4K, and normals at most 0.06°. gltfpack's defaults are coarser (12-bit UVs are about a texel at 4K).
+
+A close-up of the dragon renders at 40 dB PSNR against the original, with Nanite off. GitHub refuses files over 100 MB, so pack any large model you add the same way.
 
 ## Things to try
 

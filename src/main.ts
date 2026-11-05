@@ -8,7 +8,7 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 
 type Source = { kind: 'file'; file: File } | { kind: 'url'; url: string };
 
-const DEFAULT_MODEL = 'dragon.glb';
+const DEFAULT_MODEL = 'models/dragon.glb';
 
 const state = {
   viewMode: 0,
@@ -44,7 +44,7 @@ async function main() {
 
   const param = new URLSearchParams(location.search).get('model');
   const initial = param ?? (files.includes(DEFAULT_MODEL) ? DEFAULT_MODEL : files[0]);
-  if (initial) loadModel({ kind: 'url', url: initial.startsWith('/') ? initial : '/' + initial });
+  if (initial) loadModel({ kind: 'url', url: initial });
   else $('model-info').innerHTML = '<dt>Open or drop a .glb to start</dt><dd></dd>';
 
   requestAnimationFrame(frame);
@@ -168,7 +168,8 @@ async function fetchWithProgress(url: string): Promise<ArrayBuffer> {
 
 async function listProjectModels(): Promise<string[]> {
   try {
-    const res = await fetch('/__models');
+    // Relative, so it resolves next to index.html wherever the build is hosted.
+    const res = await fetch('models.json');
     if (!res.ok || !(res.headers.get('content-type') ?? '').includes('json')) return [];
     const files: string[] = await res.json();
     const box = $('models');
@@ -176,13 +177,13 @@ async function listProjectModels(): Promise<string[]> {
       const b = document.createElement('button');
       b.className = 'file';
       b.textContent = displayName(f);
-      b.title = `Load ${f} from the project folder`;
-      b.onclick = () => loadModel({ kind: 'url', url: '/' + f });
+      b.title = `Load ${f}`;
+      b.onclick = () => loadModel({ kind: 'url', url: f });
       box.insertBefore(b, $('btn-open'));
     }
     return files;
   } catch {
-    return []; // not running under the dev server
+    return []; // no model list: open or drop a file instead
   }
 }
 
