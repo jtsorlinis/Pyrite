@@ -3,7 +3,9 @@
 //         culling, and appends survivors to a visible list + indirect draw args.
 //   draw: vertex pulling. One instance per visible cluster, 128*3 vertices per instance;
 //         triangles past the cluster's count collapse to nothing.
+//   sky:  (in the draw module) the environment map behind textured models.
 //   mip:  fullscreen blit used to build texture mip chains (WebGPU has no generateMipmap).
+//   prefilter: GGX-blurs the environment once per roughness level for reflections.
 
 const common = /* wgsl */ `
 struct Uniforms {
@@ -23,6 +25,12 @@ struct Uniforms {
   roughnessFactor: f32,
   normalScale: f32,
   pad: f32,
+  invViewProj: mat4x4f,
+  sh: array<vec4f, 9>,  // environment irradiance / PI, spherical harmonics
+  exposure: f32,
+  envMaxLod: f32,       // roughness 1 maps to this reflection mip
+  pad1: f32,
+  pad2: f32,
 };
 
 struct Cluster {
@@ -152,6 +160,9 @@ ${common}
 @group(0) @binding(8) var baseColorTex: texture_2d<f32>;
 @group(0) @binding(9) var normalTex: texture_2d<f32>;
 @group(0) @binding(10) var metalRoughTex: texture_2d<f32>;
+@group(0) @binding(11) var envSampler: sampler;
+@group(0) @binding(12) var envSpecular: texture_2d<f32>; // mip i = GGX roughness i / envMaxLod
+@group(0) @binding(13) var envSky: texture_2d<f32>;
 
 struct VSOut {
   @builtin(position) pos: vec4f,
@@ -236,7 +247,35 @@ fn perturbNormal(n: vec3f, p: vec3f, uv: vec2f, tn: vec3f) -> vec3f {
   return normalize(mat3x3f(t * invmax, b * invmax, n) * tn);
 }
 
-// glTF metallic-roughness: Lambert diffuse + GGX specular from one sun, plus hemisphere ambient.
+/** Equirectangular lookup; matches texelDir() in environment.ts. */
+fn equirectUv(d: vec3f) -> vec2f {
+  return vec2f(atan2(d.z, d.x) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
+}
+
+fn irradiance(n: vec3f) -> vec3f {
+  let s = u.sh;
+  let e = s[0].xyz * 0.282095
+    + s[1].xyz * (0.488603 * n.y) + s[2].xyz * (0.488603 * n.z) + s[3].xyz * (0.488603 * n.x)
+    + s[4].xyz * (1.092548 * n.x * n.y) + s[5].xyz * (1.092548 * n.y * n.z)
+    + s[6].xyz * (0.315392 * (3.0 * n.z * n.z - 1.0)) + s[7].xyz * (1.092548 * n.x * n.z)
+    + s[8].xyz * (0.546274 * (n.x * n.x - n.y * n.y));
+  return max(e, vec3f(0.0));
+}
+
+// Split-sum environment BRDF, analytic fit (Karis, "Physically Based Shading on Mobile").
+fn envBrdf(f0: vec3f, rough: f32, nv: f32) -> vec3f {
+  let r = rough * vec4f(-1.0, -0.0275, -0.572, 0.022) + vec4f(1.0, 0.0425, 1.04, -0.04);
+  let a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+  let ab = vec2f(-1.04, 1.04) * a004 + r.zw;
+  return f0 * ab.x + ab.y;
+}
+
+fn tonemap(c: vec3f) -> vec3f {
+  return c * (2.51 * c + 0.03) / (c * (2.43 * c + 0.59) + 0.14); // ACES (Narkowicz fit)
+}
+
+// glTF metallic-roughness lit only by the environment map: diffuse from its spherical harmonics,
+// reflections from the GGX-prefiltered mip matching the surface roughness.
 fn shadeTextured(in: VSOut, front: bool) -> vec3f {
   let base = textureSample(baseColorTex, samp, in.uv) * u.baseColorFactor; // linear (sRGB texture)
   let mr = textureSample(metalRoughTex, samp, in.uv);
@@ -253,27 +292,13 @@ fn shadeTextured(in: VSOut, front: bool) -> vec3f {
   let rough = clamp(mr.g * u.roughnessFactor, 0.045, 1.0);
   let metal = clamp(mr.b * u.metallicFactor, 0.0, 1.0);
 
-  let h = normalize(SUN_DIR + v);
-  let nl = max(dot(n, SUN_DIR), 0.0);
   let nv = max(dot(n, v), 1e-4);
-  let nh = max(dot(n, h), 0.0);
-  let vh = max(dot(v, h), 0.0);
-  let a2 = pow(rough, 4.0);
-  let dd = nh * nh * (a2 - 1.0) + 1.0;
-  let d = a2 / (PI * dd * dd);
-  let k = (rough + 1.0) * (rough + 1.0) / 8.0;
-  let g = (nl / (nl * (1.0 - k) + k)) * (nv / (nv * (1.0 - k) + k));
   let f0 = mix(vec3f(0.04), base.rgb, metal);
-  let f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
-  let spec = d * g * f / max(4.0 * nl * nv, 1e-4);
-  let diffuse = (1.0 - f) * (1.0 - metal) * base.rgb / PI;
-  let sun = vec3f(1.0, 0.96, 0.9) * 3.2;
-
-  let sky = mix(vec3f(0.07, 0.06, 0.05), vec3f(0.2, 0.23, 0.28), n.y * 0.5 + 0.5);
-  let ambient = sky * (base.rgb * (1.0 - metal) + f0 * (1.0 - rough * 0.7));
-  let fill = base.rgb * (1.0 - metal) * nv * 0.12; // soft headlight so the shadow side keeps detail
-  let c = (diffuse + spec) * sun * nl + ambient + fill;
-  return c * (2.51 * c + 0.03) / (c * (2.43 * c + 0.59) + 0.14); // ACES (Narkowicz fit)
+  let brdf = envBrdf(f0, rough, nv);
+  let r = reflect(-v, n);
+  let spec = textureSampleLevel(envSpecular, envSampler, equirectUv(r), rough * u.envMaxLod).rgb * brdf;
+  let diffuse = irradiance(n) * base.rgb * (1.0 - metal) * (1.0 - brdf);
+  return tonemap((diffuse + spec) * u.exposure);
 }
 
 @fragment
@@ -286,6 +311,28 @@ fn fs(in: VSOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
     default: { color = shadeFlat(in, vec3f(0.75, 0.74, 0.72)); }
   }
   return vec4f(pow(clamp(color, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0);
+}
+
+struct SkyOut {
+  @builtin(position) pos: vec4f,
+  @location(0) ndc: vec2f,
+};
+
+@vertex
+fn skyVs(@builtin(vertex_index) i: u32) -> SkyOut {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0; // fullscreen triangle
+  var o: SkyOut;
+  o.pos = vec4f(p, 0.0, 1.0);
+  o.ndc = p;
+  return o;
+}
+
+@fragment
+fn skyFs(in: SkyOut) -> @location(0) vec4f {
+  let h = u.invViewProj * vec4f(in.ndc, 1.0, 1.0); // a point on the near plane
+  let d = normalize(h.xyz / h.w - u.camPos.xyz);
+  let c = tonemap(textureSampleLevel(envSky, envSampler, equirectUv(d), 0.0).rgb * u.exposure);
+  return vec4f(pow(clamp(c, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)), 1.0);
 }
 `;
 
@@ -310,5 +357,76 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
   return textureSampleLevel(src, samp, in.uv, 0.0);
+}
+`;
+
+export const prefilterShader = /* wgsl */ `
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> params: vec4f; // roughness, source texel solid angle, source mips
+
+const PI = 3.14159265;
+const SAMPLES = 256u;
+
+struct VOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VOut {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  var o: VOut;
+  o.pos = vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  o.uv = vec2f(p.x, 1.0 - p.y);
+  return o;
+}
+
+fn uvDir(uv: vec2f) -> vec3f {
+  let theta = uv.y * PI;
+  let phi = (uv.x - 0.5) * 2.0 * PI;
+  return vec3f(cos(phi) * sin(theta), cos(theta), sin(phi) * sin(theta));
+}
+
+fn equirectUv(d: vec3f) -> vec2f {
+  return vec2f(atan2(d.z, d.x) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
+}
+
+fn hammersley(i: u32) -> vec2f {
+  return vec2f(f32(i) / f32(SAMPLES), f32(reverseBits(i)) * 2.3283064365386963e-10);
+}
+
+// GGX importance sampling with view = normal (the split-sum assumption). Each sample reads a source
+// mip sized to its solid angle ("filtered importance sampling"), which keeps bright spots smooth.
+@fragment
+fn fs(in: VOut) -> @location(0) vec4f {
+  let n = uvDir(in.uv);
+  let rough = params.x;
+  if (rough <= 0.0) {
+    return vec4f(textureSampleLevel(src, samp, in.uv, 0.0).rgb, 1.0);
+  }
+  let a2 = pow(rough, 4.0);
+  let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(n.y) < 0.999);
+  let t = normalize(cross(up, n));
+  let b = cross(n, t);
+  var sum = vec3f(0.0);
+  var weight = 0.0;
+  for (var i = 0u; i < SAMPLES; i++) {
+    let xi = hammersley(i);
+    let phi = 2.0 * PI * xi.x;
+    let cosT = sqrt((1.0 - xi.y) / (1.0 + (a2 - 1.0) * xi.y));
+    let sinT = sqrt(1.0 - cosT * cosT);
+    let h = t * (cos(phi) * sinT) + b * (sin(phi) * sinT) + n * cosT;
+    let l = 2.0 * cosT * h - n;
+    let nl = dot(n, l);
+    if (nl > 0.0) {
+      let dd = cosT * cosT * (a2 - 1.0) + 1.0;
+      let pdf = a2 / (PI * dd * dd) / 4.0;
+      let mip = clamp(0.5 * log2(1.0 / (f32(SAMPLES) * pdf * params.y)) + 1.0, 0.0, params.z - 1.0);
+      sum += textureSampleLevel(src, samp, equirectUv(l), mip).rgb * nl;
+      weight += nl;
+    }
+  }
+  return vec4f(sum / max(weight, 1e-4), 1.0);
 }
 `;
