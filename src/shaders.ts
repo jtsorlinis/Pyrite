@@ -10,8 +10,8 @@ struct Uniforms {
   viewProj: mat4x4f,
   planes: array<vec4f, 6>,
   camPos: vec4f,
-  lodScale: f32,      // viewport height in CSS pixels / (2 * tan(fovY / 2))
-  threshold: f32,     // max allowed projected error, CSS pixels
+  lodScale: f32,      // render-target height in pixels / (2 * tan(fovY / 2))
+  threshold: f32,     // max allowed projected error, rendered pixels
   minDist: f32,
   spacing: f32,       // instance grid spacing
   numClusters: u32,
