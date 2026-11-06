@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pyrite</title>
+    <script type="module" crossorigin src="./assets/index-CL-kVRjL.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DgFNXhNv.css">
+  </head>
+  <body>
+    <canvas id="gpu"></canvas>
+
+    <aside id="panel">
+      <header>
+        <h1>Pyrite</h1>
+        <p class="sub">Nanite-style cluster LOD in WebGPU</p>
+      </header>
+
+      <section>
+        <h2>Model</h2>
+        <div class="buttons" id="models">
+          <button id="btn-open">Open .glb…</button>
+        </div>
+        <input type="file" id="file" accept=".glb,.gltf" hidden />
+        <dl class="kv" id="model-info"></dl>
+      </section>
+
+      <section>
+        <h2>This frame</h2>
+        <div class="hero"><span id="st-tris">–</span><small>triangles drawn</small></div>
+        <dl class="kv">
+          <dt>Clusters drawn</dt><dd id="st-clusters">–</dd>
+          <dt>Occlusion culled</dt><dd id="st-occ">–</dd>
+          <dt>Pixel error</dt><dd id="st-err">–</dd>
+          <dt>Scene triangles</dt><dd id="st-scene">–</dd>
+          <dt>Drawn / scene</dt><dd id="st-ratio">–</dd>
+          <dt>Frame</dt><dd id="st-fps">–</dd>
+          <dt>GPU select + raster</dt><dd id="st-gpu">n/a</dd>
+        </dl>
+        <div class="levels-head"><span>Clusters per DAG level</span><span class="muted">fine → coarse</span></div>
+        <div id="levels"></div>
+        <div id="overflow" class="warn" hidden></div>
+      </section>
+
+      <section>
+        <h2>Settings</h2>
+        <div class="seg" id="view-mode">
+          <button data-v="0" class="on">Texture</button>
+          <button data-v="1">Triangle</button>
+        </div>
+        <div class="field">
+          <span>Quality (max pixel error)</span>
+          <button id="nanite" class="toggle on" aria-pressed="true">Nanite enabled</button>
+          <div id="lod-options">
+            <div class="seg" id="quality">
+              <button data-v="4">Low (4px)</button>
+              <button data-v="2">Medium (2px)</button>
+              <button data-v="1" class="on">High (1px)</button>
+            </div>
+            <label class="sub-label check"><input type="checkbox" id="cap" autocomplete="off" /> Triangle cap</label>
+            <div id="cap-options" hidden>
+              <div class="seg" id="budget">
+                <button data-v="500000">500K</button>
+                <button data-v="1000000" class="on">1M</button>
+                <button data-v="2000000">2M</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <label class="slider">
+          <span>Instances <output id="grid-out">1</output></span>
+          <input type="range" id="grid" min="1" max="24" value="1" />
+        </label>
+      </section>
+
+      <footer>
+        <div><kbd>Drag</kbd> orbit · <kbd>Right-drag</kbd> pan · <kbd>Wheel</kbd> zoom</div>
+        <div><kbd>R</kbd> reframe</div>
+        <div>Drop a .glb anywhere to load it.</div>
+      </footer>
+    </aside>
+
+    <div id="overlay" hidden>
+      <div class="box">
+        <div id="ov-title">Loading…</div>
+        <div class="bar"><div id="ov-fill"></div></div>
+        <div id="ov-detail"></div>
+      </div>
+    </div>
+
+    <div id="drop" hidden><div>Drop .glb to load</div></div>
+
+    <div id="fatal" hidden></div>
+
+  </body>
+</html>
