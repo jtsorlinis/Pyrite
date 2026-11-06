@@ -103,8 +103,9 @@ function reframe() {
     state.instances === 1
       ? [[0, 0, 0]]
       : [[-hx, 0, -hz], [hx, 0, -hz], [-hx, 0, hz], [hx, 0, hz]];
-  // A lone model gets a little more room around it than a grid does.
-  camera.fit(model.positions, corners, renderer.aspect, state.instances === 1 ? 0.8 : 0.9);
+  // Pivot on the middle of the grid at the model's mid-height. A lone model gets a little more
+  // room around it than a grid does.
+  camera.fit(model.positions, corners, model.center, renderer.aspect, state.instances === 1 ? 0.8 : 0.9);
 }
 
 // --- model loading -----------------------------------------------------------------------------
