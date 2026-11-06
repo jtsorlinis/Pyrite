@@ -2,7 +2,8 @@
 //   cull: four compute entry points, run in order each frame:
 //         histogram - only with a triangle cap: for every visible (cluster, instance), how many
 //                     triangles it adds to the cut at each pixel-error threshold (a histogram over
-//                     log2(threshold))
+//                     log2(threshold)). Visible as main sees it: in the frustum and not behind last
+//                     frame's depth, so the cap counts what gets drawn.
 //         pick      - the pixel-error setting, raised just enough to fit the cap if there is one
 //         main      - the parallel DAG-cut LOD test with that threshold, plus frustum culling and
 //                     (with occlusion culling) a test against last frame's HZB; appends what passes
@@ -238,9 +239,10 @@ fn appendVisible(draw: bool, which: u32, start: u32, entry: vec2u, triCount: u32
 }
 
 // Pass 1. Cluster c is in the cut for thresholds t with own <= t < parent, so it adds triCount at
-// bin(own) and removes it again at bin(parent). Bins are summed in workgroup memory first: every
-// level-0 cluster lands in bin 0, and one global atomic per thread there would serialize badly.
-// (Workgroup memory starts zeroed, as WGSL guarantees.)
+// bin(own) and removes it again at bin(parent). Pick never goes finer than the quality setting, so
+// counting starts at that bin: a cluster the cut has left by then adds nothing. Bins are summed in
+// workgroup memory first: many clusters land in the same bin, and one global atomic per thread
+// there would serialize badly. (Workgroup memory starts zeroed, as WGSL guarantees.)
 @compute @workgroup_size(HIST_GROUP)
 fn histogram(@builtin(global_invocation_id) gid: vec3u) {
   let ci = gid.x;
@@ -250,13 +252,15 @@ fn histogram(@builtin(global_invocation_id) gid: vec3u) {
     let c = clusters[ci];
     let off = instanceOffset(gid.y);
     if (inFrustum(c.bounds, off)) {
-      a = binOf(projectedError(c.lodBounds, c.lodError, off));
+      a = max(binOf(projectedError(c.lodBounds, c.lodError, off)), binOf(u.threshold));
       if (c.parentLevel != ROOT) {
         b = binOf(projectedError(c.parentBounds, c.parentError, off));
       }
-      // Own and parent error in the same bin: the cluster is never in the cut at any threshold we
-      // can pick, so it adds nothing. That's most fine clusters of distant instances.
-      if (a < b) {
+      // a >= b: the cluster is never in the cut at any threshold pick can choose, so it adds
+      // nothing. That's most fine clusters. What last frame's depth hides, main defers and post
+      // only draws if this frame's depth shows it, which a still camera's never does, so it isn't
+      // counted. (A moving camera can bring a few of those into view and run slightly over.)
+      if (a < b && !(u.testPrev != 0u && occluded(c.bounds, off, u.prevView, u.prevProj))) {
         atomicAdd(&localHist[a], c.triCount);
         if (b < BINS) {
           atomicSub(&localHist[b], c.triCount);
@@ -284,11 +288,11 @@ fn histogram(@builtin(global_invocation_id) gid: vec3u) {
   }
 }
 
-// Pass 2. Start from the pixel-error setting. With a cap, also find the finest threshold whose cut
-// fits it (triangles in the cut only go down as the threshold rises, so walk up from the finest and
-// stop at the first that fits: 512 steps on one thread, a few microseconds) and use whichever of
-// the two is coarser. The quality presets sit exactly on bins, so a setting that already fits is
-// never raised.
+// Pass 2. Start from the pixel-error setting. With a cap, also find the finest threshold from
+// there up whose cut fits it (triangles in the cut only go down as the threshold rises, so walk up
+// and stop at the first that fits: at most 512 steps on one thread, a few microseconds) and use
+// whichever of the two is coarser. The quality presets sit exactly on bins, so a setting that
+// already fits is never raised. Histogram counted nothing below the setting's bin.
 @compute @workgroup_size(1)
 fn pick() {
   var chosen = u.threshold;
@@ -296,7 +300,7 @@ fn pick() {
   if (u.budget > 0u) {
     var total = 0u;
     var fits = NOTHING_FITS;
-    for (var k = 0u; k < BINS; k++) {
+    for (var k = binOf(u.threshold); k < BINS; k++) {
       total += atomicLoad(&hist[k]);
       if (total <= u.budget) {
         fits = thresholdOf(k);
