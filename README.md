@@ -13,6 +13,8 @@ Needs a WebGPU browser (recent Chrome, Edge, or Safari). `public/models/dragon.g
 
 `npm run build` writes a static site to `dist/` that works from any path, GitHub Pages included: the models are copied in, and the list of them goes into `models.json`.
 
+`npm run deploy` builds and pushes `dist/` to the `gh-pages` branch, which GitHub Pages serves.
+
 The bundled models are packed for the web with `npm run pack-model -- in.glb public/models/out.glb` (needs `cwebp`: `brew install webp`), which takes the dragon from 150 MB to 32 MB and the warrior from 92 MB to 24 MB:
 
 - **Tangents dropped**: the renderer never reads them.

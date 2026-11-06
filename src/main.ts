@@ -155,17 +155,27 @@ async function fetchWithProgress(url: string): Promise<ArrayBuffer> {
   if ((res.headers.get('content-type') ?? '').includes('text/html')) throw new Error(`${url} not found`);
   const total = Number(res.headers.get('content-length')) || 0;
   if (!res.body || !total) return res.arrayBuffer();
-  const out = new Uint8Array(total);
+  // Content-Length is the size on the wire. When the server compresses the response (GitHub Pages
+  // gzips .glb files) the body we read is bigger than that, so the buffer grows as needed and the
+  // progress shows no total.
+  const compressed = res.headers.has('content-encoding');
+  const mb = (n: number) => (n / 2 ** 20).toFixed(0);
+  let out = new Uint8Array(total);
   const reader = res.body.getReader();
   let got = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (got + value.length > out.length) {
+      const bigger = new Uint8Array(Math.max(out.length * 2, got + value.length));
+      bigger.set(out.subarray(0, got));
+      out = bigger;
+    }
     out.set(value, got);
     got += value.length;
-    setProgress(`Downloading ${(got / 2 ** 20).toFixed(0)} / ${(total / 2 ** 20).toFixed(0)} MB`, 0);
+    setProgress(compressed ? `Downloading ${mb(got)} MB` : `Downloading ${mb(got)} / ${mb(total)} MB`, 0);
   }
-  return out.buffer;
+  return got === out.length ? out.buffer : out.buffer.slice(0, got);
 }
 
 async function listProjectModels(): Promise<string[]> {
