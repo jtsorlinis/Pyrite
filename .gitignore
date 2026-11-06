@@ -1,8 +1,0 @@
-node_modules
-dist
-*.glb
-*.gltf
-!public/models/*.glb
-!public/models/*.gltf
-*.hdr
-.DS_Store
