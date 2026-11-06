@@ -1,6 +1,6 @@
 import { Renderer, type GpuStats } from './renderer';
 import { OrbitCamera } from './camera';
-import { lookAt, perspectiveReversedInfinite } from './math';
+import { lookAt, perspectiveReversedInfinite, type Vec3 } from './math';
 import { loadGltf, type MaterialInfo } from './loader';
 import type { BuildResult, MeshInput } from './builder';
 
@@ -14,9 +14,8 @@ const state = {
   viewMode: 0,
   nanite: true, // off = draw the original mesh with no LOD
   threshold: 1, // max projected error in pixels while Nanite is on
-  cap: false, // triangle cap on: the GPU raises the error just enough to fit the budget
-  budget: 1_000_000, // the cap's size, used only while it's on
-  grid: 1,
+  budget: 5_000_000, // triangle cap, 0 = off: the GPU raises the error just enough to fit it
+  instances: 1,
 };
 
 const canvas = $<HTMLCanvasElement>('gpu');
@@ -63,6 +62,7 @@ function frame(t: number) {
   const near = Math.max(Math.min(camera.distance * 0.01, radius * 0.01), radius * 1e-6);
   const proj = perspectiveReversedInfinite(camera.fovY, renderer.aspect, near);
   const eye = camera.eye;
+  const grid = gridDims();
   renderer.render({
     view: lookAt(eye, camera.target, [0, 1, 0]),
     proj,
@@ -71,9 +71,10 @@ function frame(t: number) {
     fovY: camera.fovY,
     nanite: state.nanite,
     threshold: state.threshold,
-    budget: state.cap ? state.budget : 0,
+    budget: state.budget,
     viewMode: state.viewMode,
-    gridSize: state.grid,
+    gridCols: grid.cols,
+    gridRows: grid.rows,
     spacing: spacing(),
   });
   requestAnimationFrame(frame);
@@ -84,10 +85,26 @@ function spacing() {
   return Math.max(model.aabbMax[0] - model.aabbMin[0], model.aabbMax[2] - model.aabbMin[2], model.radius * 0.5) * 1.25;
 }
 
+/** The instance grid: the most nearly square cols x rows that holds exactly state.instances. */
+function gridDims() {
+  const n = state.instances;
+  let rows = Math.floor(Math.sqrt(n));
+  while (n % rows) rows--;
+  return { cols: n / rows, rows };
+}
+
+/** Fits the camera to every instance, using the model's vertices so nothing is fitted loosely. */
 function reframe() {
   if (!model) return;
-  const gridR = (spacing() * (state.grid - 1)) / Math.SQRT2;
-  camera.frame(model.center, model.radius + gridR);
+  const { cols, rows } = gridDims();
+  const hx = (spacing() * (cols - 1)) / 2;
+  const hz = (spacing() * (rows - 1)) / 2;
+  const corners: Vec3[] =
+    state.instances === 1
+      ? [[0, 0, 0]]
+      : [[-hx, 0, -hz], [hx, 0, -hz], [-hx, 0, hz], [hx, 0, hz]];
+  // A lone model gets a little more room around it than a grid does.
+  camera.fit(model.positions, corners, renderer.aspect, state.instances === 1 ? 0.8 : 0.9);
 }
 
 // --- model loading -----------------------------------------------------------------------------
@@ -260,7 +277,7 @@ function onStats(s: GpuStats) {
   const now = performance.now();
   if (now - lastStatsUpdate < 120 || !model) return;
   lastStatsUpdate = now;
-  const sceneTris = model.sourceTriangles * state.grid * state.grid;
+  const sceneTris = model.sourceTriangles * state.instances;
   $('st-tris').textContent = fmt(s.triangles);
   const drawn = fmt(Math.min(s.clusters, renderer.capacity));
   $('st-clusters').textContent = `${drawn} (${fmt(s.lateClusters)} late)`;
@@ -308,12 +325,10 @@ function bindUi() {
   const modes = segmented('view-mode', (v) => (state.viewMode = v));
   segmented('quality', (v) => (state.threshold = v));
   segmented('budget', (v) => (state.budget = v));
-  const cap = $<HTMLInputElement>('cap');
-  cap.checked = state.cap; // don't let the browser restore a stale checkbox state on reload
-  cap.onchange = () => {
-    state.cap = cap.checked;
-    $('cap-options').hidden = !state.cap;
-  };
+  segmented('instances', (v) => {
+    state.instances = v;
+    reframe();
+  });
   const nanite = $<HTMLButtonElement>('nanite');
   nanite.onclick = () => {
     state.nanite = !state.nanite;
@@ -323,14 +338,8 @@ function bindUi() {
     $('lod-options').hidden = !state.nanite;
   };
 
-  const grid = $<HTMLInputElement>('grid');
-  grid.oninput = () => {
-    state.grid = Number(grid.value);
-    $('grid-out').textContent = fmt(state.grid * state.grid);
-  };
-
   window.addEventListener('keydown', (e) => {
-    if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
+    if (e.target instanceof HTMLInputElement) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.code === 'KeyR') reframe();
     else if (/^Digit[1-2]$/.test(e.code)) modes[Number(e.code.slice(5)) - 1].click();

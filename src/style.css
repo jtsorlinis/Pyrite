@@ -205,8 +205,7 @@ button:disabled {
   background: rgba(70, 200, 120, 0.22);
 }
 
-.field,
-.slider {
+.field {
   display: block;
   margin-top: 9px;
 }
@@ -219,31 +218,6 @@ button:disabled {
 .field .sub-label {
   margin-top: 8px;
 }
-.field .check {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-.check input {
-  margin: 0;
-  accent-color: var(--accent);
-}
-.slider span {
-  display: flex;
-  justify-content: space-between;
-  color: var(--muted);
-}
-.slider output {
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
-.slider input {
-  width: 100%;
-  margin: 4px 0 0;
-  accent-color: var(--accent);
-}
-
 kbd {
   font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
   background: rgba(255, 255, 255, 0.08);

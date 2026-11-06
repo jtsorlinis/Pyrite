@@ -24,7 +24,8 @@ export interface FrameParams {
   threshold: number; // max projected error in rendered pixels while Nanite is on
   budget: number; // triangle cap while Nanite is on, 0 = none
   viewMode: number;
-  gridSize: number;
+  gridCols: number; // instances: gridCols x gridRows copies on the ground plane
+  gridRows: number;
   spacing: number;
 }
 
@@ -480,7 +481,7 @@ export class Renderer {
     f[46] = s?.minDist ?? 1e-6;
     f[47] = p.spacing;
     u[48] = s?.numClusters ?? 0;
-    u[49] = p.gridSize;
+    u[49] = p.gridCols;
     u[50] = p.viewMode;
     u[51] = this.capacity;
     const m = s?.material;
@@ -490,6 +491,7 @@ export class Renderer {
     f[58] = m?.normalScale ?? 1;
     u[59] = p.nanite ? 0 : 1; // fullDetail: LOD selection off
     u[60] = Math.max(0, Math.min(0xffffffff, Math.round(p.budget)));
+    u[61] = p.gridRows;
     f.set(p.view, 64);
     f.set(prev?.view ?? p.view, 80);
     f.set(proj, 96);
@@ -511,7 +513,7 @@ export class Renderer {
     if (s) {
       enc.clearBuffer(this.histBuffer);
       const cp = enc.beginComputePass({ timestampWrites: timestamps(0) });
-      const groups = [Math.ceil(s.numClusters / 64), p.gridSize * p.gridSize] as const;
+      const groups = [Math.ceil(s.numClusters / 64), p.gridCols * p.gridRows] as const;
       cp.setBindGroup(0, s.cullBindGroup);
       cp.setBindGroup(1, this.hzb!.mainBindGroup);
       if (p.nanite) {

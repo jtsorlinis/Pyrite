@@ -25,7 +25,7 @@ struct Uniforms {
   minDist: f32,
   spacing: f32,       // instance grid spacing
   numClusters: u32,
-  gridSize: u32,
+  gridCols: u32,      // instances are laid out on a gridCols x gridRows grid
   viewMode: u32,      // 0 = textured, 1 = triangle colours
   capacity: u32,      // size of the visible list
   baseColorFactor: vec4f,
@@ -34,7 +34,7 @@ struct Uniforms {
   normalScale: f32,
   fullDetail: u32,    // 1 = Nanite off: draw the original mesh (every level-0 cluster)
   budget: u32,        // triangle cap, 0 = none; pick raises the threshold until the cut fits
-  pad0: u32,
+  gridRows: u32,
   pad1: u32,
   pad2: u32,
   view: mat4x4f,      // world -> view space (the camera looks down -z)
@@ -66,9 +66,9 @@ const ROOT = 0xffffffffu;
 @group(0) @binding(1) var<storage, read> clusters: array<Cluster>;
 
 fn instanceOffset(i: u32) -> vec3f {
-  let n = u.gridSize;
-  let half = f32(n - 1u) * 0.5;
-  return vec3f(f32(i % n) - half, 0.0, f32(i / n) - half) * u.spacing;
+  let n = u.gridCols;
+  let half = vec2f(f32(n - 1u), f32(u.gridRows - 1u)) * 0.5;
+  return vec3f(f32(i % n) - half.x, 0.0, f32(i / n) - half.y) * u.spacing;
 }
 `;
 

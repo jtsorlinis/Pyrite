@@ -30,9 +30,9 @@ A close-up of the dragon renders at 40 dB PSNR against the original, with Nanite
 - **Texture / Triangle** view (keys 1–2). Texture uses the model's base colour, normal and metallic-roughness maps; Triangle gives each triangle its own colour.
 - **Nanite enabled / disabled**: turn it off to draw the original mesh everywhere (culling still applies), for comparison.
 - **Quality** Low / Medium / High (while Nanite is on): allows 4 / 2 / 1 px of error, measured in rendered pixels (so on a 2× display, High is half a CSS pixel). Drop it and whole regions collapse to coarser DAG levels.
-- **Triangle cap** (off by default): tick it, then pick 500K / 1M / 2M. If the quality setting would draw more than this, the GPU raises the pixel error just enough to fit (the stats then show it as *capped*). This mirrors how pixel-error LOD is usually run: constant quality, with a budget only as a ceiling.
+- **Triangle cap** (5M by default, or off). If the quality setting would draw more than that, the GPU raises the pixel error just enough to fit (the stats then show it as *capped*). This mirrors how pixel-error LOD is usually run: constant quality, with a budget only as a ceiling.
 - **Occlusion culling** (always on) pays off when things hide each other: drop the camera to the ground among many instances and watch *Occlusion culled* climb (with Nanite off, 169 full-detail dragons went from 114M triangles drawn to 9M, and raster time from 39 ms to 4.5 ms). On a lone model it hides little, and its fixed cost (about 0.7 ms on an Apple GPU at 1024×768, mostly the two HZB builds) outweighs that.
-- **Instances**: up to 576 copies, laid out on a square grid. 144 dragons is 453M source triangles, of which about 1% get drawn.
+- **Instances**: 1, 100 or 1,000 copies, laid out on a 10×10 or 40×25 grid. Changing the count (or pressing R) returns the camera to its starting angle and fits them on screen. 100 dragons is 315M source triangles, of which about 1% get drawn.
 
 ## How it works
 

@@ -48,6 +48,14 @@
           <button data-v="1">Triangle</button>
         </div>
         <div class="field">
+          <span>Instances</span>
+          <div class="seg" id="instances">
+            <button data-v="1" class="on">1</button>
+            <button data-v="100">100</button>
+            <button data-v="1000">1,000</button>
+          </div>
+        </div>
+        <div class="field">
           <span>Quality (max pixel error)</span>
           <button id="nanite" class="toggle on" aria-pressed="true">Nanite enabled</button>
           <div id="lod-options">
@@ -56,20 +64,13 @@
               <button data-v="2">Medium (2px)</button>
               <button data-v="1" class="on">High (1px)</button>
             </div>
-            <label class="sub-label check"><input type="checkbox" id="cap" autocomplete="off" /> Triangle cap</label>
-            <div id="cap-options" hidden>
-              <div class="seg" id="budget">
-                <button data-v="500000">500K</button>
-                <button data-v="1000000" class="on">1M</button>
-                <button data-v="2000000">2M</button>
-              </div>
+            <span class="sub-label">Triangle cap</span>
+            <div class="seg" id="budget">
+              <button data-v="0">Off</button>
+              <button data-v="5000000" class="on">5M</button>
             </div>
           </div>
         </div>
-        <label class="slider">
-          <span>Instances <output id="grid-out">1</output></span>
-          <input type="range" id="grid" min="1" max="24" value="1" />
-        </label>
       </section>
 
       <footer>
