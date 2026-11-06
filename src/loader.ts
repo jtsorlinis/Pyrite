@@ -14,6 +14,8 @@ export interface RawMesh {
   uvs: Float32Array; // TEXCOORD_0, zeros when the mesh has none
   indices: Uint32Array;
   materialCount: number;
+  /** Some material asks for both sides of its faces to be drawn (glTF `doubleSided`). */
+  doubleSided: boolean;
   /** Decodes the model's material; null when it uses more than one (not supported). */
   material: Promise<MaterialInfo> | null;
 }
@@ -142,6 +144,8 @@ export async function loadGltf(data: ArrayBuffer): Promise<RawMesh> {
     uvs,
     indices: io === indices.length ? indices : indices.slice(0, io),
     materialCount: materials.size,
+    // Primitives without a material (-1) get glTF's default one, which is single-sided.
+    doubleSided: [...materials].some((m) => m >= 0 && file.json.materials?.[m]?.doubleSided === true),
     material: only === null ? null : loadMaterial(file, only),
   };
 }

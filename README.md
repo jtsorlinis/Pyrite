@@ -24,9 +24,10 @@ A close-up of the dragon renders at 40 dB PSNR against the original, with Nanite
 ## Things to try
 
 - **Texture / Triangle** view (keys 1–2). Texture uses the model's base colour, normal and metallic-roughness maps; Triangle gives each triangle its own colour.
-- **Nanite enabled / disabled**: turn it off to draw the original mesh everywhere (frustum culling still applies), for comparison.
+- **Nanite enabled / disabled**: turn it off to draw the original mesh everywhere (culling still applies), for comparison.
 - **Quality** Low / Medium / High (while Nanite is on): allows 4 / 2 / 1 px of error, measured in rendered pixels (so on a 2× display, High is half a CSS pixel). Drop it and whole regions collapse to coarser DAG levels.
 - **Triangle cap** (off by default): tick it, then pick 500K / 1M / 2M. If the quality setting would draw more than this, the GPU raises the pixel error just enough to fit (the stats then show it as *capped*). This mirrors how pixel-error LOD is usually run: constant quality, with a budget only as a ceiling.
+- **Occlusion culling** (always on) pays off when things hide each other: drop the camera to the ground among many instances and watch *Occlusion culled* climb (with Nanite off, 169 full-detail dragons went from 114M triangles drawn to 9M, and raster time from 39 ms to 4.5 ms). On a lone model it hides little, and its fixed cost (about 0.7 ms on an Apple GPU at 1024×768, mostly the two HZB builds) outweighs that.
 - **Instances**: up to 576 copies, laid out on a square grid. 144 dragons is 453M source triangles, of which about 1% get drawn.
 
 ## How it works
@@ -48,7 +49,9 @@ A close-up of the dragon renders at 40 dB PSNR against the original, with Nanite
 
 - **Triangle cap → threshold** (two compute passes, only while a cap is set): a cluster is in the cut for every threshold between its own projected error and its parent's, so each visible (cluster, instance) adds its triangles to a histogram bin at its own error and subtracts them at its parent's. Summing the bins in order gives "triangles drawn at threshold t" for 512 thresholds from 1/64 px to 1024 px (2% apart); a one-thread pass finds the smallest one within the cap and uses it if it's coarser than the quality setting. Same frame, no feedback lag; a capped frame lands within about 2% under the cap. It roughly doubles selection cost (about 2 ms instead of 0.5 ms for 144 dragons), since every cluster of every instance is visited twice.
 - **Cull pass**: one thread per (cluster, instance). A cluster is drawn when `projectedError(lod) <= threshold < projectedError(parent)`. A parent and its children read exactly the same stored values, and every cluster uses the same threshold, so the selected cut never overlaps or leaves holes, and no tree traversal is needed. The same pass does frustum culling and appends survivors to a visible list plus indirect draw args.
-- **Draw**: a single `drawIndirect` with one instance per visible cluster and 384 vertices each. The vertex shader pulls indices, positions, normals and UVs from storage buffers, and triangles beyond a cluster's count collapse to nothing. The Triangle view shades flat facets from screen-space derivatives.
+- **Occlusion culling** (two-pass, as in Nanite): the cull pass also tests each cluster's bounding sphere against last frame's HZB, a depth pyramid holding the farthest depth under each texel, seen from last frame's camera. Clusters that pass are drawn; hidden ones are deferred. The HZB is then rebuilt from that first draw, a post pass retests the deferred clusters against it with this frame's camera, and the ones that show get a second draw. That's what catches anything that came out from behind something this frame. A final HZB build from the finished depth serves the next frame. The sphere test projects the exact screen rectangle of the sphere, picks the HZB level where it spans at most 2×2 texels, and culls when the sphere's nearest point is behind all four. The pyramid takes one dispatch per four levels (three at typical sizes): each reduces 16×16 tiles four levels down in workgroup memory. With the triangle cap on, the budget counts clusters in the frustum before occlusion, so the drawn count stays under it.
+- **Back-face culling**: in the rasterizer (`cullMode: 'back'`), counter-clockwise front faces as glTF specifies, unless the material is double-sided. Both bundled models are marked double-sided, so they draw both sides. The loader keeps the winding through mirrored transforms, and the simplifier preserves it.
+- **Draw**: two `drawIndirect`s (one per occlusion pass), with one instance per visible cluster and 384 vertices each. The vertex shader pulls indices, positions, normals and UVs from storage buffers, and triangles beyond a cluster's count collapse to nothing. The Triangle view shades flat facets from screen-space derivatives.
 - **Texture view**: glTF metallic-roughness shading (Lambert + GGX, one sun plus sky light, ACES tone mapping). Textures are uploaded with a generated mip chain and capped at 4096 px. The normal map's tangent frame is built from screen-space derivatives, so no tangents are stored and simplification can't break them.
 
 The builder was checked offline: simulated cuts on closed test meshes with UV seams have zero open edges, which means no cracks.
@@ -59,7 +62,6 @@ Keeping UV seams costs triangles. On the dragon at the default view, the texture
 
 These parts of real Nanite are missing:
 
-- **Occlusion culling**: no two-pass HZB.
 - **Software rasterizer**: there's no compute rasterizer for pixel-sized triangles.
 - **Hierarchical culling**: selection scans every cluster × instance instead of walking a BVH.
 - **Streaming**: everything is resident on the GPU.

@@ -1,6 +1,6 @@
 import { Renderer, type GpuStats } from './renderer';
 import { OrbitCamera } from './camera';
-import { lookAt, multiply, perspectiveReversedInfinite } from './math';
+import { lookAt, perspectiveReversedInfinite } from './math';
 import { loadGltf, type MaterialInfo } from './loader';
 import type { BuildResult, MeshInput } from './builder';
 
@@ -64,7 +64,9 @@ function frame(t: number) {
   const proj = perspectiveReversedInfinite(camera.fovY, renderer.aspect, near);
   const eye = camera.eye;
   renderer.render({
-    viewProj: multiply(proj, lookAt(eye, camera.target, [0, 1, 0])),
+    view: lookAt(eye, camera.target, [0, 1, 0]),
+    proj,
+    near,
     camPos: eye,
     fovY: camera.fovY,
     nanite: state.nanite,
@@ -131,7 +133,7 @@ async function loadModel(src: Source) {
     const material = await mesh.material;
     if (my !== jobId) return;
     materialSummary = summarizeMaterial(material, mesh.materialCount);
-    renderer.setScene(result, material);
+    renderer.setScene(result, material, mesh.doubleSided);
     model = result;
     modelName = label;
     onModelLoaded();
@@ -250,7 +252,9 @@ function onStats(s: GpuStats) {
   lastStatsUpdate = now;
   const sceneTris = model.sourceTriangles * state.grid * state.grid;
   $('st-tris').textContent = fmt(s.triangles);
-  $('st-clusters').textContent = fmt(Math.min(s.clusters, renderer.capacity));
+  const drawn = fmt(Math.min(s.clusters, renderer.capacity));
+  $('st-clusters').textContent = `${drawn} (${fmt(s.lateClusters)} late)`;
+  $('st-occ').textContent = `${fmt(s.occluded)} clusters`;
   const t = s.threshold;
   const px = `${t < 1 ? t.toFixed(2) : t.toFixed(1)} px`;
   $('st-err').textContent = !state.nanite ? 'none (full mesh)' : t > 1e30 ? 'coarsest (over cap)' : s.capped ? `${px} (capped)` : px;

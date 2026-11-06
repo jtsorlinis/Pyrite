@@ -1,12 +1,23 @@
 // WebGPU renderer: GPU cluster selection (compute) + indirect vertex-pulled draw.
+//
+// Frame (occlusion culling is two-pass, as in Nanite):
+//   1. cull (main): LOD cut + frustum, then a test against last frame's HZB. What passes goes to
+//      the first draw; what last frame's depth hides is deferred.
+//   2. draw the first list.
+//   3. build the HZB from that depth, and retest the deferred list against it (post).
+//   4. draw what post found visible: things that came into view this frame.
+//   5. build the HZB again from the finished depth, for the next frame's step 1.
+// With no model loaded, the first draw just clears the screen.
 
 import { MAX_CLUSTER_TRIS, type BuildResult } from './builder';
 import type { MaterialInfo } from './loader';
-import { frustumPlanes, type Mat4, type Vec3 } from './math';
-import { cullShader, drawShader, mipShader } from './shaders';
+import { frustumPlanes, multiply, type Mat4, type Vec3 } from './math';
+import { cullShader, drawShader, hzbShader, mipShader } from './shaders';
 
 export interface FrameParams {
-  viewProj: Mat4;
+  view: Mat4;
+  proj: Mat4; // from perspectiveReversedInfinite
+  near: number; // the near plane proj was built with
   camPos: Vec3;
   fovY: number;
   nanite: boolean; // false: draw the original mesh, no LOD
@@ -18,22 +29,34 @@ export interface FrameParams {
 }
 
 export interface GpuStats {
-  clusters: number;
+  clusters: number; // drawn, both draws
+  lateClusters: number; // drawn by the second draw: hidden last frame, visible now
+  occluded: number; // clusters occlusion culling removed
   triangles: number;
   overflow: number;
   levels: Uint32Array;
   threshold: number; // pixel error actually used (3e38 when even the DAG roots exceed the cap)
   capped: boolean; // the triangle cap raised it above the quality setting
-  gpuCullMs: number | null; // null when timestamp queries aren't supported
+  gpuCullMs: number | null; // selection, culling and HZB builds; null without timestamp queries
   gpuDrawMs: number | null;
 }
 
-const UNIFORM_SIZE = 256;
-const STATS_SIZE = 16 + 32 * 4;
+const UNIFORM_SIZE = 512;
+const STATS_SIZE = 16 + 32 * 4 + 16; // ..., levels, occluded + padding
+const DRAW_ARGS_SIZE = 32; // first draw, second draw
 const SAMPLES = 4;
-const READBACK_SIZE = 16 + STATS_SIZE + 32; // draw args + stats + 4 timestamps
+// Begin/end timestamps of: cull, first draw, HZB + post cull, second draw, HZB.
+const QUERIES = 10;
+const READBACK_SIZE = DRAW_ARGS_SIZE + STATS_SIZE + QUERIES * 8;
 const HIST_BINS = 512; // must match BINS in the cull shader
 const HIST_GROUP = 256; // must match HIST_GROUP in the cull shader
+
+interface Hzb {
+  texture: GPUTexture;
+  steps: { pipeline: GPUComputePipeline; bindGroup: GPUBindGroup; groups: readonly [number, number] }[];
+  mainBindGroup: GPUBindGroup; // the whole pyramid + post's dispatch args, for main
+  postBindGroup: GPUBindGroup; // the whole pyramid, for post
+}
 
 interface Scene {
   buffers: GPUBuffer[];
@@ -43,6 +66,7 @@ interface Scene {
   drawBindGroup: GPUBindGroup;
   numClusters: number;
   minDist: number;
+  cullBack: boolean; // skip back-facing triangles: the material isn't double-sided
 }
 
 export class Renderer {
@@ -51,12 +75,20 @@ export class Renderer {
 
   private format: GPUTextureFormat;
   private cullPipeline: GPUComputePipeline;
+  private postPipeline: GPUComputePipeline;
   private histogramPipeline: GPUComputePipeline;
   private pickPipeline: GPUComputePipeline;
+  private hzbFromDepthPipeline: GPUComputePipeline;
+  private hzbDownPipeline: GPUComputePipeline;
   private histBuffer: GPUBuffer;
-  private lodBuffer: GPUBuffer;
-  private drawPipeline: GPURenderPipeline;
+  private cullStateBuffer: GPUBuffer;
+  private postArgsBuffer: GPUBuffer;
+  private deferredBuffer: GPUBuffer;
+  /** [first draw, second draw] x [no culling, back-face culling]. */
+  private drawPipelines: GPURenderPipeline[][];
   private cullLayout: GPUBindGroupLayout;
+  private hzbMainLayout: GPUBindGroupLayout;
+  private hzbPostLayout: GPUBindGroupLayout;
   private drawLayout: GPUBindGroupLayout;
   private uniformBuffer: GPUBuffer;
   private drawArgsBuffer: GPUBuffer;
@@ -65,6 +97,12 @@ export class Renderer {
   private readbacks: { buffer: GPUBuffer; busy: boolean }[] = [];
   private colorTex: GPUTexture | null = null;
   private depthTex: GPUTexture | null = null;
+  private hzb: Hzb | null = null;
+  /** 1x1 targets for the HZB dispatch slots past the pyramid's last level. */
+  private hzbStandIns: GPUTexture[];
+  /** The HZB holds the last frame's finished depth, seen from `prev`. */
+  private hzbValid = false;
+  private prev: { view: Mat4; proj: number[] } | null = null;
   private scene: Scene | null = null;
   private uniformData = new ArrayBuffer(UNIFORM_SIZE);
   private context: GPUCanvasContext;
@@ -113,9 +151,16 @@ export class Renderer {
         { binding: 3, visibility: C, buffer: { type: 'storage' } },
         { binding: 4, visibility: C, buffer: { type: 'storage' } },
         { binding: 5, visibility: C, buffer: { type: 'storage' } }, // threshold histogram
-        { binding: 6, visibility: C, buffer: { type: 'storage' } }, // chosen threshold
+        { binding: 6, visibility: C, buffer: { type: 'storage' } }, // threshold, post's dispatch
+        { binding: 7, visibility: C, buffer: { type: 'storage' } }, // deferred list
       ],
     });
+    // Group 1: the HZB, plus (for main only) post's indirect dispatch args.
+    const hzbEntry: GPUBindGroupLayoutEntry = { binding: 0, visibility: C, texture: { sampleType: 'unfilterable-float' } };
+    this.hzbMainLayout = device.createBindGroupLayout({
+      entries: [hzbEntry, { binding: 1, visibility: C, buffer: { type: 'storage' } }],
+    });
+    this.hzbPostLayout = device.createBindGroupLayout({ entries: [hzbEntry] });
     this.drawLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: V | F, buffer: { type: 'uniform' } },
@@ -129,38 +174,55 @@ export class Renderer {
         { binding: 8, visibility: F, texture: { sampleType: 'float' } }, // base colour
         { binding: 9, visibility: F, texture: { sampleType: 'float' } }, // normal map
         { binding: 10, visibility: F, texture: { sampleType: 'float' } }, // metallic-roughness
+        { binding: 11, visibility: V, buffer: { type: 'read-only-storage' } }, // draw args
       ],
     });
 
     const cullModule = device.createShaderModule({ code: cullShader, label: 'cull' });
+    const hzbModule = device.createShaderModule({ code: hzbShader, label: 'hzb' });
     const drawModule = device.createShaderModule({ code: drawShader, label: 'draw' });
     this.mipModule = device.createShaderModule({ code: mipShader, label: 'mip' });
-    for (const m of [cullModule, drawModule, this.mipModule]) {
+    for (const m of [cullModule, hzbModule, drawModule, this.mipModule]) {
       m.getCompilationInfo().then((info) => {
         for (const msg of info.messages) console[msg.type === 'error' ? 'error' : 'warn'](`${m.label}:${msg.lineNum}:${msg.linePos} ${msg.message}`);
       });
     }
 
-    const cullPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.cullLayout] });
-    const computePipeline = (entryPoint: string) =>
-      device.createComputePipeline({ layout: cullPipelineLayout, compute: { module: cullModule, entryPoint } });
+    const mainLayout = device.createPipelineLayout({ bindGroupLayouts: [this.cullLayout, this.hzbMainLayout] });
+    const postLayout = device.createPipelineLayout({ bindGroupLayouts: [this.cullLayout, this.hzbPostLayout] });
+    const computePipeline = (entryPoint: string, layout = mainLayout) =>
+      device.createComputePipeline({ layout, compute: { module: cullModule, entryPoint } });
     this.histogramPipeline = computePipeline('histogram');
     this.pickPipeline = computePipeline('pick');
     this.cullPipeline = computePipeline('main');
+    this.postPipeline = computePipeline('post', postLayout);
+    this.hzbFromDepthPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: hzbModule, entryPoint: 'fromDepth' } });
+    this.hzbDownPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: hzbModule, entryPoint: 'down' } });
     this.histBuffer = device.createBuffer({ size: HIST_BINS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    this.lodBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
-    this.drawPipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.drawLayout] }),
-      vertex: { module: drawModule, entryPoint: 'vs' },
-      fragment: { module: drawModule, entryPoint: 'fs', targets: [{ format: this.format }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
-      multisample: { count: SAMPLES },
+    this.cullStateBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.postArgsBuffer = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
     });
+    this.deferredBuffer = device.createBuffer({ size: this.capacity * 8, usage: GPUBufferUsage.STORAGE });
+    this.hzbStandIns = [0, 1, 2].map(() => device.createTexture({ size: [1, 1], format: 'r32float', usage: GPUTextureUsage.STORAGE_BINDING }));
+
+    const drawPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.drawLayout] });
+    const drawPipeline = (post: boolean, cullMode: GPUCullMode) =>
+      device.createRenderPipeline({
+        layout: drawPipelineLayout,
+        vertex: { module: drawModule, entryPoint: 'vs', constants: { POST: post ? 1 : 0 } },
+        fragment: { module: drawModule, entryPoint: 'fs', targets: [{ format: this.format }] },
+        // Front faces are counter-clockwise: the loader keeps glTF's winding, mirrored nodes included.
+        primitive: { topology: 'triangle-list', cullMode, frontFace: 'ccw' },
+        depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+        multisample: { count: SAMPLES },
+      });
+    this.drawPipelines = [false, true].map((post) => [drawPipeline(post, 'none'), drawPipeline(post, 'back')]);
 
     this.uniformBuffer = device.createBuffer({ size: UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.drawArgsBuffer = device.createBuffer({
-      size: 16,
+      size: DRAW_ARGS_SIZE,
       usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.statsBuffer = device.createBuffer({
@@ -185,13 +247,13 @@ export class Renderer {
     this.mipSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     if (device.features.has('timestamp-query')) {
       this.timing = {
-        querySet: device.createQuerySet({ type: 'timestamp', count: 4 }),
-        resolve: device.createBuffer({ size: 32, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+        querySet: device.createQuerySet({ type: 'timestamp', count: QUERIES }),
+        resolve: device.createBuffer({ size: QUERIES * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
       };
     }
   }
 
-  setScene(r: BuildResult, material: MaterialInfo | null) {
+  setScene(r: BuildResult, material: MaterialInfo | null, doubleSided: boolean) {
     const d = this.device;
     if (this.scene) {
       for (const b of this.scene.buffers) b.destroy();
@@ -230,7 +292,8 @@ export class Renderer {
         { binding: 3, resource: { buffer: this.visibleBuffer } },
         { binding: 4, resource: { buffer: this.statsBuffer } },
         { binding: 5, resource: { buffer: this.histBuffer } },
-        { binding: 6, resource: { buffer: this.lodBuffer } },
+        { binding: 6, resource: { buffer: this.cullStateBuffer } },
+        { binding: 7, resource: { buffer: this.deferredBuffer } },
       ],
     });
     const drawBindGroup = d.createBindGroup({
@@ -247,8 +310,10 @@ export class Renderer {
         { binding: 8, resource: baseColor.createView() },
         { binding: 9, resource: normalMap.createView() },
         { binding: 10, resource: metalRough.createView() },
+        { binding: 11, resource: { buffer: this.drawArgsBuffer } },
       ],
     });
+    this.hzbValid = false; // last frame's depth is of another model
     this.scene = {
       buffers: [clusterBuffer, indexBuffer, positionBuffer, normalBuffer, uvBuffer],
       textures: [baseColor, normalMap, metalRough],
@@ -262,6 +327,7 @@ export class Renderer {
       cullBindGroup,
       drawBindGroup,
       numClusters: r.clusterCount,
+      cullBack: !doubleSided,
       minDist: r.radius * 1e-6,
     };
   }
@@ -325,7 +391,68 @@ export class Renderer {
       this.colorTex?.destroy();
       this.depthTex?.destroy();
       this.colorTex = this.device.createTexture({ size: [w, h], format: this.format, sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT });
-      this.depthTex = this.device.createTexture({ size: [w, h], format: 'depth32float', sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+      this.depthTex = this.device.createTexture({
+        size: [w, h],
+        format: 'depth32float',
+        sampleCount: SAMPLES,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.createHzb(w, h);
+    }
+  }
+
+  /** The depth pyramid for a w x h target (see hzbShader for its layout). */
+  private createHzb(w: number, h: number) {
+    const d = this.device;
+    this.hzb?.texture.destroy();
+    this.hzbValid = false;
+    const pow2 = (n: number) => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
+    const w0 = pow2(Math.ceil(w / 2));
+    const h0 = pow2(Math.ceil(h / 2));
+    const count = Math.log2(Math.max(w0, h0)) + 1;
+    const texture = d.createTexture({
+      label: 'hzb',
+      size: [w0, h0],
+      format: 'r32float',
+      mipLevelCount: count,
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const level = (i: number) => texture.createView({ baseMipLevel: i, mipLevelCount: 1 });
+    // Dispatch k writes levels 4k..4k+3, the first from the depth buffer, the rest from level 4k-1.
+    const steps = [];
+    for (let k = 0; 4 * k < count; k++) {
+      const pipeline = k === 0 ? this.hzbFromDepthPipeline : this.hzbDownPipeline;
+      const src = k === 0 ? { binding: 0, resource: this.depthTex!.createView() } : { binding: 1, resource: level(4 * k - 1) };
+      const outs = [0, 1, 2, 3].map((j) => ({
+        binding: 2 + j,
+        resource: 4 * k + j < count ? level(4 * k + j) : this.hzbStandIns[j - 1].createView(),
+      }));
+      // One thread per texel of the level it starts from: level 0, or the level read.
+      const base = k === 0 ? 0 : 4 * k - 1;
+      steps.push({
+        pipeline,
+        bindGroup: d.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [src, ...outs] }),
+        groups: [Math.ceil(Math.max(1, w0 >> base) / 16), Math.ceil(Math.max(1, h0 >> base) / 16)] as const,
+      });
+    }
+    const pyramid = { binding: 0, resource: texture.createView() };
+    this.hzb = {
+      texture,
+      steps,
+      mainBindGroup: d.createBindGroup({
+        layout: this.hzbMainLayout,
+        entries: [pyramid, { binding: 1, resource: { buffer: this.postArgsBuffer } }],
+      }),
+      postBindGroup: d.createBindGroup({ layout: this.hzbPostLayout, entries: [pyramid] }),
+    };
+  }
+
+  /** Rebuilds the whole pyramid from the depth buffer as it stands. */
+  private buildHzb(pass: GPUComputePassEncoder) {
+    for (const step of this.hzb!.steps) {
+      pass.setPipeline(step.pipeline);
+      pass.setBindGroup(0, step.bindGroup);
+      pass.dispatchWorkgroups(...step.groups);
     }
   }
 
@@ -337,11 +464,14 @@ export class Renderer {
     this.ensureTargets();
     const d = this.device;
     const s = this.scene;
+    const proj = [p.proj[0], p.proj[5], p.near, 0];
+    const prev = this.hzbValid ? this.prev : null;
 
     const f = new Float32Array(this.uniformData);
     const u = new Uint32Array(this.uniformData);
-    f.set(p.viewProj, 0);
-    f.set(frustumPlanes(p.viewProj), 16);
+    const viewProj = multiply(p.proj, p.view);
+    f.set(viewProj, 0);
+    f.set(frustumPlanes(viewProj), 16);
     f.set([...p.camPos, 1], 40);
     // LOD error is measured in rendered pixels (the canvas's backing size, after devicePixelRatio),
     // so "1px" means one pixel of the image actually drawn.
@@ -360,19 +490,30 @@ export class Renderer {
     f[58] = m?.normalScale ?? 1;
     u[59] = p.nanite ? 0 : 1; // fullDetail: LOD selection off
     u[60] = Math.max(0, Math.min(0xffffffff, Math.round(p.budget)));
+    f.set(p.view, 64);
+    f.set(prev?.view ?? p.view, 80);
+    f.set(proj, 96);
+    f.set(prev?.proj ?? proj, 100);
+    u[104] = this.canvas.width;
+    u[105] = this.canvas.height;
+    u[106] = prev ? 1 : 0; // testPrev
     d.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
-    d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([MAX_CLUSTER_TRIS * 3, 0, 0, 0]));
+    const V = MAX_CLUSTER_TRIS * 3;
+    d.queue.writeBuffer(this.drawArgsBuffer, 0, new Uint32Array([V, 0, 0, 0, V, 0, 0, 0]));
+    d.queue.writeBuffer(this.cullStateBuffer, 0, new Uint32Array([0])); // nothing deferred yet
+    d.queue.writeBuffer(this.postArgsBuffer, 0, new Uint32Array([0, 1, 1])); // post: 0 x 1 x 1 groups
     d.queue.writeBuffer(this.statsBuffer, 0, new Uint32Array(STATS_SIZE / 4));
 
     const enc = d.createCommandEncoder();
     const ts = s ? this.timing : null;
+    const timestamps = (i: number) =>
+      ts ? { querySet: ts.querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } : undefined;
     if (s) {
       enc.clearBuffer(this.histBuffer);
-      const cp = enc.beginComputePass(
-        ts ? { timestampWrites: { querySet: ts.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
-      );
+      const cp = enc.beginComputePass({ timestampWrites: timestamps(0) });
       const groups = [Math.ceil(s.numClusters / 64), p.gridSize * p.gridSize] as const;
       cp.setBindGroup(0, s.cullBindGroup);
+      cp.setBindGroup(1, this.hzb!.mainBindGroup);
       if (p.nanite) {
         // Settle this frame's threshold: the quality setting, raised if needed to fit the cap.
         if (p.budget > 0) {
@@ -386,38 +527,61 @@ export class Renderer {
       cp.dispatchWorkgroups(...groups);
       cp.end();
     }
-    const rp = enc.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.colorTex!.createView(),
-          resolveTarget: this.context.getCurrentTexture().createView(),
-          clearValue: { r: 0.075, g: 0.08, b: 0.095, a: 1 },
-          loadOp: 'clear',
-          storeOp: 'discard',
+
+    // The first draw clears; the second loads, and resolves to the screen.
+    const draw = (second: boolean, last: boolean) => {
+      const rp = enc.beginRenderPass({
+        colorAttachments: [
+          {
+            view: this.colorTex!.createView(),
+            resolveTarget: last ? this.context.getCurrentTexture().createView() : undefined,
+            clearValue: { r: 0.075, g: 0.08, b: 0.095, a: 1 },
+            loadOp: second ? 'load' : 'clear',
+            storeOp: last ? 'discard' : 'store',
+          },
+        ],
+        depthStencilAttachment: {
+          view: this.depthTex!.createView(),
+          depthClearValue: 0,
+          depthLoadOp: second ? 'load' : 'clear',
+          depthStoreOp: s ? 'store' : 'discard', // the HZB is built from it
         },
-      ],
-      depthStencilAttachment: {
-        view: this.depthTex!.createView(),
-        depthClearValue: 0,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'discard',
-      },
-      timestampWrites: ts ? { querySet: ts.querySet, beginningOfPassWriteIndex: 2, endOfPassWriteIndex: 3 } : undefined,
-    });
+        timestampWrites: timestamps(second ? 3 : 1),
+      });
+      if (s) {
+        rp.setPipeline(this.drawPipelines[second ? 1 : 0][s.cullBack ? 1 : 0]);
+        rp.setBindGroup(0, s.drawBindGroup);
+        rp.drawIndirect(this.drawArgsBuffer, second ? 16 : 0);
+      }
+      rp.end();
+    };
+    draw(false, !s);
     if (s) {
-      rp.setPipeline(this.drawPipeline);
-      rp.setBindGroup(0, s.drawBindGroup);
-      rp.drawIndirect(this.drawArgsBuffer, 0);
+      // What last frame's depth hid, against the depth drawn so far this frame.
+      const cp = enc.beginComputePass({ timestampWrites: timestamps(2) });
+      this.buildHzb(cp);
+      cp.setPipeline(this.postPipeline);
+      cp.setBindGroup(0, s.cullBindGroup);
+      cp.setBindGroup(1, this.hzb!.postBindGroup);
+      cp.dispatchWorkgroupsIndirect(this.postArgsBuffer, 0);
+      cp.end();
+      draw(true, true);
+      // The finished depth, for next frame's first test.
+      const hp = enc.beginComputePass({ timestampWrites: timestamps(4) });
+      this.buildHzb(hp);
+      hp.end();
     }
-    rp.end();
+    this.hzbValid = s !== null;
+    this.prev = { view: p.view, proj };
 
     const rb = s ? this.readbacks.find((r) => !r.busy) : undefined;
+    const queries = QUERIES;
     if (rb) {
-      enc.copyBufferToBuffer(this.drawArgsBuffer, 0, rb.buffer, 0, 16);
-      enc.copyBufferToBuffer(this.statsBuffer, 0, rb.buffer, 16, STATS_SIZE);
+      enc.copyBufferToBuffer(this.drawArgsBuffer, 0, rb.buffer, 0, DRAW_ARGS_SIZE);
+      enc.copyBufferToBuffer(this.statsBuffer, 0, rb.buffer, DRAW_ARGS_SIZE, STATS_SIZE);
       if (ts) {
-        enc.resolveQuerySet(ts.querySet, 0, 4, ts.resolve, 0);
-        enc.copyBufferToBuffer(ts.resolve, 0, rb.buffer, 16 + STATS_SIZE, 32);
+        enc.resolveQuerySet(ts.querySet, 0, queries, ts.resolve, 0);
+        enc.copyBufferToBuffer(ts.resolve, 0, rb.buffer, DRAW_ARGS_SIZE + STATS_SIZE, queries * 8);
       }
     }
     d.queue.submit([enc.finish()]);
@@ -430,17 +594,21 @@ export class Renderer {
           rb.buffer.unmap();
           rb.busy = false;
           const data = new Uint32Array(bytes);
-          const t = new BigUint64Array(bytes, 16 + STATS_SIZE, 4);
-          const ms = (a: bigint, b: bigint) => (b > a ? Number(b - a) / 1e6 : 0);
+          const st = DRAW_ARGS_SIZE / 4; // stats, in words
+          const t = new BigUint64Array(bytes, DRAW_ARGS_SIZE + STATS_SIZE, queries);
+          // Pass i's time; passes past the ones that ran this frame count as 0.
+          const pass = (i: number) => (2 * i + 1 < queries && t[2 * i + 1] > t[2 * i] ? Number(t[2 * i + 1] - t[2 * i]) / 1e6 : 0);
           this.onStats?.({
-            clusters: data[1],
-            triangles: data[4],
-            overflow: data[5],
-            levels: data.slice(8, 40),
-            threshold: new Float32Array(bytes, 16 + 8, 1)[0],
-            capped: data[7] === 1,
-            gpuCullMs: ts ? ms(t[0], t[1]) : null,
-            gpuDrawMs: ts ? ms(t[2], t[3]) : null,
+            clusters: data[1] + data[5],
+            lateClusters: data[5],
+            occluded: data[st + 36],
+            triangles: data[st],
+            overflow: data[st + 1],
+            levels: data.slice(st + 4, st + 36),
+            threshold: new Float32Array(bytes, DRAW_ARGS_SIZE + 8, 1)[0],
+            capped: data[st + 3] === 1,
+            gpuCullMs: ts ? pass(0) + pass(2) + pass(4) : null,
+            gpuDrawMs: ts ? pass(1) + pass(3) : null,
           });
         },
         () => (rb.busy = false),
